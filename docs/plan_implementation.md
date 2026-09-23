@@ -578,3 +578,84 @@ suffit à démarrer le relai, l'éteindre l'arrête, une coupure BLE ponctuelle 
   Wireshark, ou équivalent) si un doute apparaît côté firmware sur ce qui est effectivement émis à
   l'antenne — plus fiable qu'un simple log logiciel pour diagnostiquer un problème de timing/crédit
   L2CAP.
+
+### Sniffer nRF52840 — opérationnel (2026-09-23)
+
+**Statut : outil prêt à l'emploi, pas encore utilisé pour une vraie session de capture Phase 2.**
+
+Matériel : clones nRF52840 génériques ("SuperMini NRF52840", compatibles nice!nano,
+bootloader UF2 Adafruit, VID/PID bootloader `239A:00B3`). Deux exemplaires en main.
+
+**Chaîne d'outils installée en portable** (aucune installation admin/UAC, tout sous
+`%USERPROFILE%\softs_portable\`) :
+- `nrfutil\` — CLI Nordic (`nrfutil.exe`) + plugins `ble-sniffer` (capture, écrit directement en
+  `.pcap`, pilotable 100% en ligne de commande, pas besoin de Wireshark) et `device`. Le firmware
+  officiel (`.hex`) est fourni tel quel dans
+  `nrfutil\home\share\nrfutil-ble-sniffer\firmware\`.
+- `jlink_portable\` — `JLink.exe` + `JLinkARM.dll` de SEGGER, extraits de l'installeur officiel via
+  7-Zip sans l'exécuter (l'installeur NSIS se laisse extraire directement). Nécessaire car le clone
+  J-Link utilisé (VID SEGGER `1366:0101`, firmware "ARM-OB STM32", S/N générique — clone qui imite
+  le protocole SEGGER) a besoin de la vraie DLL SEGGER (`--jlink-dll` sous `nrfutil device`, ou
+  directement `JLink.exe -CommanderScript <script>`).
+- `wireshark_portable\` — `tshark.exe` seul, extrait de la même façon (pas d'installation, pas
+  besoin de Npcap puisqu'on ne capture jamais depuis une carte réseau — uniquement pour relire/
+  décoder les `.pcap` produits par `nrfutil ble-sniffer`).
+- `uf2tools\` — `uf2conv.py` (Microsoft) + table des familles, utile si on repasse par le bootloader
+  UF2 un jour (family ID nRF52840 = `0xADA52840`).
+
+**Piège rencontré et résolu** : le firmware `sniffer_nrf52840dk_nrf52840_4.1.1.hex` (prévu pour la
+vraie carte nRF52840-DK) est bare-metal, sans SoftDevice, table de vecteurs à l'adresse `0x0`. Flashé
+naïvement par UF2 drag-and-drop sur le bootloader Adafruit (qui a lui aussi besoin de l'adresse `0x0`
+pour son MBR/redirection double-reset), ça écrase le MBR et casse l'accès au bootloader — carte
+inaccessible en USB (ni port série, ni lecteur bootloader), **mais pas brickée au niveau silicium**.
+Récupérable par SWD. **Leçon : ce firmware sniffer ne doit être flashé QUE par SWD (J-Link/ST-Link),
+jamais par UF2/drag-and-drop, sur ce type de carte.**
+
+**Câblage SWD confirmé pour ce clone "SuperMini"** (pads au dos, sérigraphiés) :
+
+| J-Link | Pad carte |
+|---|---|
+| VCC | VDD (mesuré 3.3V) |
+| SWDIO | DIO |
+| SWDCLK | CLK |
+| GND | GND |
+
+**Deux variantes du firmware Nordic testées** — la bonne dépend de l'architecture USB de la carte :
+- `sniffer_nrf52840dk_nrf52840_4.1.1.hex` : suppose une sortie via une puce interface de debug
+  externe comme sur la vraie DK. **Sur notre clone (USB natif, pas de puce interface séparée), ça
+  fonctionne quand même en USB natif** — confirmé le 2026-09-23, énumère en `USB Serial Device`,
+  VID/PID `1915:522A` (Nordic officiel). C'est cette variante qui est actuellement flashée et
+  validée sur la carte fonctionnelle.
+- `sniffer_nrf52840dongle_nrf52840_4.1.1.zip` (paquet DFU app-only, `.bin`+`.dat`, pas de
+  SoftDevice/MBR inclus) : testée aussi (flashée en `.bin` brut à l'adresse `0x0` par SWD), n'a
+  donné aucune énumération USB dans nos tests — non retenue pour l'instant, pas d'explication
+  définitive trouvée.
+
+**Procédure de flash validée** (`JLink.exe -CommanderScript <script.jlink>` avec un script
+contenant `device NRF52840_XXAA` / `si SWD` / `speed 4000` / `erase` / `loadfile "<hex>"` / `r` /
+`g` / `exit`) : efface toute la puce et reprogramme en ~3s, vérifié (Program & Verify OK).
+
+**État des deux cartes physiques à la fin de la session** :
+- **Carte fonctionnelle** (COM14 actuellement, le port change à chaque re-branchement) : firmware
+  sniffer Nordic officiel flashé et **testé avec succès** — capture réelle de trafic BLE ambiant
+  confirmée (`ADV_IND`/`ADV_NONCONN_IND` décodés correctement par tshark, ~131 Ko capturés en
+  quelques secondes). Plus de bootloader UF2 dessus (normal, sacrifié volontairement — carte dédiée
+  au sniffing désormais, reflashable uniquement par SWD).
+- **Carte de secours** : intacte, toujours en bootloader UF2 Adafruit fonctionnel (`D:\NICENANO`),
+  jamais touchée par un flash sniffer. Gardée en réserve.
+- La carte qui a perdu son bootloader lors de l'essai raté initial (UF2 direct, cf. piège ci-dessus)
+  est la carte devenue "Carte fonctionnelle" ci-dessus une fois recâblée en SWD — pas de carte
+  perdue, juste un aller-retour.
+
+**Commande de capture prête à l'emploi** (à lancer pendant une session de streaming Phase 2 réelle,
+en ciblant l'adresse MAC de l'ESP32 ou de l'aide auditive) :
+```
+nrfutil.exe ble-sniffer sniff --port COM14 --follow <adresse MAC> --output-pcap-file capture.pcap
+```
+(le numéro de COM peut changer après un débranchement/rebranchement — revérifier avec
+`Get-PnpDevice -Class Ports` avant chaque session).
+
+**Prochaine étape** : lancer une vraie capture pendant un cycle START → streaming → STOP entre
+l'ESP32 et l'aide Signia, pour vérifier trame par trame ce qui est réellement émis à l'antenne
+(objectif initial de cette session, pas encore fait — l'essentiel du temps est passé à fiabiliser
+l'outil lui-même).
