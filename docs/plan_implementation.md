@@ -720,7 +720,42 @@ de filtrage HiSyncId côté ESP32, pas un artefact du sniffer.
 du mode suivi après une longue période. À relancer périodiquement plutôt que de faire confiance à une
 session `--follow` de longue durée.
 
-**Bilan** : 3 corrections firmware committées (`d421dac`) — tonalité 15s, retry EBUSY, récupération
-canal bloqué. Robustesse nettement améliorée (plus de blocage silencieux permanent), mais la
-reconnexion automatique complète reste hors de portée sans intervention sur l'aide — accepté comme
-limite connue pour l'instant.
+**Suite et résolution (même session)** : idée décisive de l'utilisateur — avec un téléphone Android,
+aucune manœuvre d'extinction/rallumage n'est jamais nécessaire, ni pour la connexion initiale ni après
+une coupure. Recherche dans la doc officielle AOSP
+([source.android.com/docs/core/connect/bluetooth/asha](https://source.android.com/docs/core/connect/bluetooth/asha))
+: *"When the central isn't streaming audio data to the peripheral and can maintain a BLE connection,
+the central shouldn't disconnect from the peripheral."* — le modèle attendu est **rester connecté en
+permanence**, pas déconnecter/reconnecter à la demande.
+
+Ça remettait en cause le correctif précédent (`ble_gap_terminate()` sur canal bloqué), qui allait à
+l'encontre de ce principe. **Corrigé** (`f6421f4`) : sur canal CoC bloqué, on referme et rouvre
+**uniquement le canal L2CAP CoC** (`ble_l2cap_disconnect()` + `ble_l2cap_connect()`), sans jamais
+toucher à la connexion GAP sous-jacente — donc jamais besoin que l'aide ré-annonce.
+
+**Testé en direct avec succès total** : cycle bloqué → fermeture/réouverture du canal → nouveau
+START → reprise du streaming, répété plusieurs fois consécutives (toutes les ~2-5s selon les
+conditions radio du moment), **sans aucune intervention manuelle, sans jamais perdre la connexion**.
+Confirmé par l'utilisateur : "reconnexion automatique" fonctionnelle. La cause racine de
+l'épuisement récurrent des crédits CoC (probablement lié aux conditions radio marginales du test)
+n'a pas été investiguée plus avant, mais n'est plus bloquante : le firmware s'auto-répare de façon
+fiable et transparente.
+
+**Tentative de capture radio de la reconnexion Android** (pour comprendre le mécanisme exact) :
+sniffer relancé en scan large pendant que l'utilisateur réactivait le Bluetooth de son téléphone.
+Reconnexion Android confirmée immédiate côté utilisateur, mais **le sniffer n'a rien capté
+d'exploitable** (ni les adresses connues de l'aide, ni service 0xFDF0, ni CONNECT_IND, sur ~14000
+paquets/2min) — limite déjà connue du sniffer nRF52840 mono-radio face à un échange bref. Piste du
+PlutoSDR de l'utilisateur évoquée pour une détection d'énergie RF simple (pas un décodage protocole
+complet — bande ISM 2.4GHz de 83.5MHz trop large pour la bande passante native du Pluto ~20MHz) mais
+pas retenue pour l'instant, la piste AOSP ayant suffi.
+
+**Bilan final de la session** : 4 corrections firmware committées (`d421dac`, `f6421f4`) — tonalité
+15s, retry EBUSY, récupération canal bloqué par réouverture CoC seule (pas de déconnexion GAP).
+**Objectif de robustesse pleinement atteint** : streaming continu, auto-réparation transparente sur
+incident radio, plus besoin d'aucune intervention manuelle sur l'aide. Prêt pour Phase 3.
+
+**Piège d'environnement supplémentaire** : après un flash réussi (`esptool` confirme "Hash of data
+verified"), le hard-reset automatique via RTS peut ne pas suffire à faire redémarrer proprement
+l'application sur ce board S3 — la carte peut rester silencieuse sur le port série jusqu'à un appui
+RESET manuel (déjà vu pour l'entrée en bootloader, confirmé ici aussi pour la sortie).
