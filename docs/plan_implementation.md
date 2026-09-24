@@ -659,3 +659,68 @@ nrfutil.exe ble-sniffer sniff --port COM14 --follow <adresse MAC> --output-pcap-
 l'ESP32 et l'aide Signia, pour vérifier trame par trame ce qui est réellement émis à l'antenne
 (objectif initial de cette session, pas encore fait — l'essentiel du temps est passé à fiabiliser
 l'outil lui-même).
+
+### Session de durcissement Phase 2+ et test de portée (2026-09-24)
+
+**Contexte** : reprise sur la carte S3 (COM12, confirmée par `esptool chip-id` — attention, l'utilisateur
+avait cru par erreur que c'était le C3 en cours de session, revérifié et corrigé). Objectif : vérification
+générale avant Phase 3+, avec le sniffer nRF52840 (COM14) et un test de portée réel à pied.
+
+**Découverte 1 — firmware toujours "un seul cycle par connexion"** : le firmware ne relance jamais
+START tout seul après un STOP sur la même connexion (conçu à l'origine pour un test unique). Sans
+power-cycle de l'aide, aucune nouvelle tonalité n'est possible, même connexion GAP technique toujours
+active.
+
+**Découverte 2 — claquement de bouclage sur la tonalite de test** : sifflement 1kHz avec claquement
+fort ~1x/seconde, causé par le bouclage d'un buffer G.722 d'1s (l'état interne adaptatif de
+l'encodeur ne reconverge pas exactement au même point à chaque bouclage — vérifié empiriquement,
+même après 500ms-1s d'établissement les octets encodés ne redeviennent jamais identiques d'un cycle
+à l'autre, dérive numérique de l'implémentation ffmpeg). **Corrigé partiellement** : buffer étendu à
+15s (750 trames), donc claquement espacé à 1x/15s au lieu de 1x/s. Pas de solution parfaite trouvée
+sans réencoder — le vrai correctif est la Phase 3 (flux continu, plus de bouclage du tout).
+
+**Découverte 3 — streaming rendu continu** : boucle de streaming modifiée pour tourner jusqu'à
+déconnexion (`coc_chan != NULL`) au lieu de s'arrêter à 150 trames fixes — nécessaire pour un test de
+portée à pied prolongé.
+
+**Test de portée réel** : connexion tient jusqu'à ~1,5m, coupure au-delà. Comportement observé après
+coupure : **jamais de reconnexion automatique en ramenant l'aide à portée**, il faut systématiquement
+éteindre/rallumer l'aide.
+
+**Découverte 4 — bug reel identifie et corrige** : `ble_l2cap_send()` retournait `rc=15`
+(`BLE_HS_EBUSY`) de façon **soutenue et permanente** (des centaines de trames consécutives sur 45s+,
+jamais de récupération même aide ramenée à portée) — crédits de flux L2CAP CoC épuisés et jamais
+régénérés par l'aide après le premier accroc radio. Le lien GATT/ATT restait lui parfaitement
+fonctionnel pendant ce temps (STOP réussissait toujours via écriture caractéristique), seul le canal
+CoC audio spécifiquement restait mort. **Corrigé** : compteur d'échecs consécutifs (seuil 30, avec
+retentative bornée à 100ms par trame) déclenchant une déconnexion GAP forcée
+(`ble_gap_terminate()`) pour relancer un cycle de connexion propre avec des crédits frais — équivalent
+logiciel du cycle d'alimentation manuel. **Testé en direct : le mécanisme se déclenche bien** (log
+"canal CoC bloque — deconnexion forcee" après ~5s de blocage, `disconnect; reason=534` confirmé).
+
+**Découverte 5 — limite réelle côté aide, pas côté firmware** : après la déconnexion forcée, le scan
+reprend correctement (code ESP32 vérifié correct) mais **l'aide ne réémet plus jamais d'advertising
+avec le HiSyncId ciblé** (85+ secondes observées sans réapparition). Comportement cohérent avec TOUTES
+les observations de la session (aucune reconnexion automatique n'a jamais fonctionné, même avant les
+correctifs) : l'aide semble arrêter son advertising général après une déconnexion normale
+(économie de batterie probable) et n'accepte une nouvelle connexion qu'après un vrai cycle
+d'alimentation. **Ce n'est pas un bug firmware ESP32 — c'est une limite de conception de l'aide**,
+non contournable de notre côté sans un mécanisme de reconnexion différent (à creuser un jour via le
+sniff HCI Android d'origine, si Android arrive à reconnecter sans intervention physique — pas encore
+vérifié).
+
+**Confirmation radio directe (sniffer, aide toujours proche et sous tension)** : scan d'advertising de
+10s, 486 paquets captés (autres appareils BLE alentour), **zéro paquet des deux adresses connues de
+l'aide** (`7a:18:a5:08:44:ba` capability 0x03 / `73:aa:0a:4a:f2:72` capability 0x02). Confirme sans
+ambiguïté au niveau radio que l'aide n'émet plus RIEN en BLE après une déconnexion — pas un problème
+de filtrage HiSyncId côté ESP32, pas un artefact du sniffer.
+
+**Sniffer nRF52840 — limite supplémentaire découverte** : en mode `--follow` sur une longue durée
+(ici ~50 minutes), le sniffer a cessé de capturer sans erreur visible ni crash — désync silencieux
+du mode suivi après une longue période. À relancer périodiquement plutôt que de faire confiance à une
+session `--follow` de longue durée.
+
+**Bilan** : 3 corrections firmware committées (`d421dac`) — tonalité 15s, retry EBUSY, récupération
+canal bloqué. Robustesse nettement améliorée (plus de blocage silencieux permanent), mais la
+reconnexion automatique complète reste hors de portée sans intervention sur l'aide — accepté comme
+limite connue pour l'instant.
