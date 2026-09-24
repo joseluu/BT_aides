@@ -11,3 +11,7 @@ sdkconfig.test_server_s3
 # documente dans docs/protocole_asha_reference.md
 bug_report_HCI/
 bug_report_HCI_monaural/
+
+# Captures sniffer BLE / logs serie de sessions de debug (volumineux,
+# reproductibles a la demande, pas necessaires en historique git)
+sniffs/
