@@ -7706,13 +7706,20 @@ asha_audio_test_task(void *arg)
      * que le canal CoC est mort (credits de flux epuises et jamais
      * regeneres par l'aide, observe en test reel : ca ne recupere JAMAIS
      * tout seul, meme apres 45s+ et un retour a portee). Au-dela du seuil,
-     * on force une deconnexion GAP complete plutot que de saturer les logs
-     * indefiniment : BLE_GAP_EVENT_DISCONNECT nettoie l'etat (coc_chan,
-     * g_asha_state) et relance le scan, ce qui permet a l'aide de
-     * re-annoncer et a une nouvelle connexion fraiche (nouveaux credits)
-     * de s'etablir — equivalent logiciel du cycle extinction/rallumage
-     * manuel qui etait jusqu'ici le seul moyen de recuperer. */
+     * on referme puis rouvre UNIQUEMENT le canal L2CAP CoC (nouveaux
+     * credits), sans toucher a la connexion GAP.
+     *
+     * Important (doc officielle AOSP, source.android.com/docs/core/connect/
+     * bluetooth/asha) : "When the central isn't streaming audio data to the
+     * peripheral and can maintain a BLE connection, the central shouldn't
+     * disconnect from the peripheral." Verifie en test reel : apres une
+     * deconnexion GAP complete (essai precedent avec ble_gap_terminate()),
+     * l'aide n'emet plus AUCUN advertising avant un cycle d'alimentation
+     * manuel — confirme par capture radio (sniffer, 10s, zero paquet).
+     * Rouvrir juste le canal CoC evite ce piege : la connexion GAP reste
+     * vivante, pas besoin que l'aide re-advertise. */
     int consecutive_failures = 0;
+    bool channel_stuck = false;
 #define ASHA_MAX_CONSECUTIVE_FRAME_FAILURES 30
 
     for (int i = 0; coc_chan != NULL; i++) {
@@ -7747,9 +7754,10 @@ asha_audio_test_task(void *arg)
             os_mbuf_free_chain(sdu);
             if (consecutive_failures >= ASHA_MAX_CONSECUTIVE_FRAME_FAILURES) {
                 MODLOG_DFLT(ERROR, "ASHA: canal CoC bloque (%d echecs consecutifs) —"
-                            " deconnexion forcee pour relancer un cycle propre\n",
+                            " fermeture/reouverture du canal (connexion GAP conservee)\n",
                             consecutive_failures);
-                ble_gap_terminate(conn_handle_coc, BLE_ERR_REM_USER_CONN_TERM);
+                channel_stuck = true;
+                ble_l2cap_disconnect(coc_chan);
                 break;
             }
         } else {
@@ -7761,6 +7769,21 @@ asha_audio_test_task(void *arg)
 
     MODLOG_DFLT(INFO, "ASHA: fin du test audio placeholder, envoi STOP\n");
     asha_send_stop();
+
+    if (channel_stuck) {
+        /* Laisser BLE_L2CAP_EVENT_COC_DISCONNECTED nettoyer coc_chan/
+         * g_asha_state avant de rouvrir — evite une course avec la tache
+         * hote NimBLE qui traite l'evenement de facon asynchrone. */
+        vTaskDelay(300 / portTICK_PERIOD_MS);
+        MODLOG_DFLT(INFO, "ASHA: reouverture du canal CoC (PSM 0x%04x)...\n", g_asha_psm);
+        struct os_mbuf *sdu_rx = os_mbuf_get_pkthdr(&sdu_os_mbuf_pool, 0);
+        int rc = ble_l2cap_connect(conn_handle_coc, g_asha_psm, MTU, sdu_rx,
+                                    blecent_l2cap_coc_event_cb, NULL);
+        if (rc != 0) {
+            MODLOG_DFLT(ERROR, "ASHA: reouverture du canal CoC echouee, rc=%d"
+                        " (connexion GAP probablement perdue entre-temps)\n", rc);
+        }
+    }
 
     vTaskDelete(NULL);
 }
