@@ -759,3 +759,38 @@ incident radio, plus besoin d'aucune intervention manuelle sur l'aide. Prêt pou
 verified"), le hard-reset automatique via RTS peut ne pas suffire à faire redémarrer proprement
 l'application sur ce board S3 — la carte peut rester silencieuse sur le port série jusqu'à un appui
 RESET manuel (déjà vu pour l'entrée en bootloader, confirmé ici aussi pour la sortie).
+
+### Tentative de connexion initiale automatique après reset ESP32 (même session)
+
+**Objectif** : reproduire le comportement Android — aucune manœuvre sur l'aide nécessaire, ni pour
+la connexion initiale ni après une coupure, y compris après un reset/redémarrage du central.
+
+**Implémenté** (non committé séparément, à committer si repris) : mécanisme d'auto-connexion par
+liste blanche du contrôleur (`ble_gap_wl_set()` + `ble_gap_connect(..., NULL, ...)`), équivalent
+NimBLE de `BluetoothDevice.connectGatt(..., autoConnect=true, ...)` sur Android — le contrôleur reste
+armé en permanence sur l'adresse d'identité de l'aide (capturée via `peer_id_addr` à la première
+connexion, ou retrouvée dans le bond store persistant `ble_store_util_bonded_peers()` au boot) et se
+connecte dès la moindre annonce, sans scan actif côté hôte.
+
+**Résultat des tests en direct** : un succès isolé (connexion en 22,7s après un reset, **sans**
+toucher l'aide) s'est révélé être un faux positif — confirmé par l'utilisateur, c'était en fait la
+fenêtre d'advertising encore ouverte suite à un rallumage manuel de l'aide fait *pour un autre test*
+juste avant, pas une réémission spontanée. Tous les autres essais (plusieurs resets ESP32, aide non
+touchée) ont échoué : scan actif de 80s+ sans jamais retrouver l'aide.
+
+**Conclusion définitive** : confirme et renforce la découverte radio du début de session (scan
+sniffer dédié, zéro paquet de l'aide) — **l'aide n'émet strictement aucun advertising tant qu'elle
+n'est pas physiquement rallumée**, quel que soit le mécanisme utilisé côté central (scan actif ou
+liste blanche/auto-connect) puisque les deux nécessitent que le périphérique transmette quelque
+chose. Non réparable côté firmware ESP32. Android bénéficie du même problème mais l'évite la
+plupart du temps grâce à sa philosophie "ne jamais se déconnecter tant que c'est possible" (voir
+plus haut) — le cas d'une vraie déconnexion complète reste probablement aussi bloquant pour lui,
+simplement plus rare en usage normal.
+
+**Ce qui reste acquis et solide** : tant que la connexion GAP n'est jamais réellement coupée (grâce
+au correctif de réouverture du seul canal CoC, `f6421f4`), ce problème ne se pose jamais — c'est la
+vraie solution pratique. Le mécanisme de liste blanche reste dans le code (ne nuit pas, capture
+correctement l'adresse d'identité et bond persistant) mais ne garantit pas la reconnexion après une
+vraie perte de connexion complète (reset ESP32, perte de portée prolongée) — dans ces cas, un
+rallumage manuel de l'aide reste nécessaire, comme (probablement) pour Android dans les mêmes
+circonstances.

@@ -96,6 +96,19 @@ enum asha_state {
 static enum asha_state g_asha_state = ASHA_STATE_IDLE;
 
 static uint16_t conn_handle_coc ;
+
+/* Adresse d'identite de l'aide, capturee a la premiere connexion reussie
+ * (via ble_gap_conn_desc.peer_id_addr — l'adresse d'identite resolue si
+ * l'aide utilise une adresse privee resolvable, sinon identique a
+ * l'adresse observee sur l'air). Utilisee pour programmer la liste
+ * blanche du controleur et permettre une reconnexion "auto-connect" a la
+ * maniere d'Android (BluetoothDevice.connectGatt(..., autoConnect=true,
+ * ...)) : le controleur radio reste arme en permanence sur cette adresse
+ * et se connecte des la moindre annonce, meme tres breve — bien plus
+ * fiable qu'un scan actif cote hote pour rattraper une aide qui ne fait
+ * plus qu'un advertising peu frequent apres une deconnexion. */
+static ble_addr_t g_asha_peer_addr;
+static bool g_asha_peer_addr_known = false;
 static os_membuf_t sdu_coc_mem[OS_MEMPOOL_SIZE(COC_BUF_COUNT, MTU * 2)];
 static struct os_mempool sdu_coc_mbuf_mempool;
 static struct os_mbuf_pool sdu_os_mbuf_pool;
@@ -8404,6 +8417,16 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
                 return 0;
             }
 
+            /* Capture l'adresse d'identite pour la liste blanche (voir
+             * commentaire pres de g_asha_peer_addr). peer_id_addr (pas
+             * peer_ota_addr) car c'est l'adresse resolue/stable si l'aide
+             * utilise une adresse privee resolvable. */
+            g_asha_peer_addr = desc.peer_id_addr;
+            g_asha_peer_addr_known = true;
+            rc = ble_gap_wl_set(&g_asha_peer_addr, 1);
+            MODLOG_DFLT(INFO, "ASHA: liste blanche programmee (%s), rc=%d\n",
+                        addr_str(g_asha_peer_addr.val), rc);
+
             /* L'aide auditive exige un lien chiffre/bonde avant d'accepter le
              * canal L2CAP CoC audio. On initie l'appairage ici ; la decouverte
              * de services (et l'ouverture du canal CoC) n'a lieu qu'une fois
@@ -8542,7 +8565,32 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         /* Forget about peer. */
         peer_delete(event->disconnect.conn.conn_handle);
 
-        /* Resume scanning. */
+        if (g_asha_peer_addr_known) {
+            /* Reconnexion "auto-connect" via la liste blanche du
+             * controleur (equivalent de BluetoothDevice.connectGatt(...,
+             * autoConnect=true, ...) sur Android) plutot qu'un scan actif
+             * cote hote : peer_addr=NULL => le controleur reste arme en
+             * permanence et se connecte des la moindre annonce de l'aide,
+             * meme tres breve — cense couvrir le cas ou l'aide ne fait
+             * plus qu'un advertising peu frequent apres deconnexion,
+             * que notre scan actif classique ratait systematiquement. */
+            uint8_t own_addr_type;
+            int rc_addr = ble_hs_id_infer_auto(0, &own_addr_type);
+            if (rc_addr == 0) {
+                int rc_conn = ble_gap_connect(own_addr_type, NULL, BLE_HS_FOREVER,
+                                              NULL, blecent_gap_event, NULL);
+                MODLOG_DFLT(INFO, "ASHA: reconnexion auto-connect (liste blanche) "
+                            "armee, rc=%d\n", rc_conn);
+                if (rc_conn == 0) {
+                    return 0;
+                }
+                /* Echec (ex. deja une connexion/scan en cours) — repli sur
+                 * le scan actif classique ci-dessous. */
+            }
+        }
+
+        /* Resume scanning (pas encore de peer connu, ou echec de
+         * l'auto-connect ci-dessus). */
         blecent_scan();
         return 0;
 
@@ -8594,6 +8642,37 @@ blecent_on_sync(void)
     /* Make sure we have proper identity address set (public preferred) */
     rc = ble_hs_util_ensure_addr(0);
     assert(rc == 0);
+
+    /* Si l'aide a deja ete appairee lors d'un boot precedent (bond persiste
+     * en NVS), tenter directement une reconnexion "auto-connect" par liste
+     * blanche (equivalent Android autoConnect=true) au lieu de repartir sur
+     * un scan actif — meme apres un RESET de l'ESP32, sans rien toucher a
+     * l'aide. C'est le scenario teste en direct le 2026-09-24. Si aucun bond
+     * n'existe (tout premier demarrage), on retombe sur le scan classique. */
+    ble_addr_t bonded_peers[4];
+    int num_bonded = 0;
+    rc = ble_store_util_bonded_peers(bonded_peers, &num_bonded,
+                                      sizeof(bonded_peers) / sizeof(bonded_peers[0]));
+    if (rc == 0 && num_bonded > 0) {
+        g_asha_peer_addr = bonded_peers[0];
+        g_asha_peer_addr_known = true;
+        rc = ble_gap_wl_set(&g_asha_peer_addr, 1);
+        MODLOG_DFLT(INFO, "ASHA: bond existant trouve (%s), liste blanche"
+                    " programmee, rc=%d\n", addr_str(g_asha_peer_addr.val), rc);
+
+        uint8_t own_addr_type;
+        int rc_addr = ble_hs_id_infer_auto(0, &own_addr_type);
+        if (rc_addr == 0) {
+            int rc_conn = ble_gap_connect(own_addr_type, NULL, BLE_HS_FOREVER,
+                                          NULL, blecent_gap_event, NULL);
+            MODLOG_DFLT(INFO, "ASHA: auto-connect (liste blanche) arme au"
+                        " demarrage, rc=%d\n", rc_conn);
+            if (rc_conn == 0) {
+                return;
+            }
+        }
+        /* Echec du demarrage de l'auto-connect — repli sur le scan. */
+    }
 
     /* Begin scanning for a peripheral to connect to. */
     blecent_scan();
