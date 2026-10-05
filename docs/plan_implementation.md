@@ -663,6 +663,27 @@ et vérifié hors BLE, réécouté sur PC.
 **Critère de sortie** : trames G.722 générées par le firmware, bit-comparables (ou perceptuellement
 équivalentes) à une référence logicielle connue.
 
+**Statut : TERMINÉE (2026-10-05).**
+
+- **Choix** : encodeur SpanDSP (Steve Underwood), dans sa version maintenue **sippy/libg722**
+  (commit `4c2e79c`), copié dans `firmware_i2s_test/components/g722/` (voir `VENDOR.md`).
+  Licence : domaine public + code CMU 1993 à usage libre. C'est la même lignée que l'encodeur de la
+  pile Bluetooth d'Android (AOSP `packages/modules/Bluetooth/system/embdrv/g722`, utilisé pour
+  l'ASHA), avec le même empaquetage `(bande haute << 6) | bande basse`. Écartés : ffmpeg/libavcodec
+  (LGPL, infrastructure lourde), code de référence ITU (licence floue, plus lourd).
+- **Bit-exactitude sur PC** : libg722 (bindings Python `G722`) et l'encodeur g722 de ffmpeg
+  produisent des octets identiques sur 10 s de musique réelle (80 920 octets, 0 différence) — or
+  c'est ffmpeg qui avait encodé la tonalité acceptée par l'aide en Phase 2.
+- **Bit-exactitude sur la cible** : auto-test au démarrage, signal entier déterministe (triangle +
+  bruit LCG) encodé sur l'ESP32, CRC32 `0x3705e003` identique à la référence PC. (Piège : `//` de
+  Python arrondit vers le bas, la division entière C tronque — utiliser `>> 2` côté C.)
+- **Coût** : 12 % d'un cœur à 160 MHz pour un flux (≈ 8 % à 240 MHz). À garder en tête pour la
+  Phase 6 si les deux aides reçoivent des flux distincts (deux encodeurs).
+- **Temps réel** : 320 échantillons à 16 kHz → une trame de 160 octets toutes les 20 ms. Mode de
+  flux `G` sur l'USB-Serial/JTAG ; `tools/capture_wav.py ... g722` enregistre le `.g722` et le
+  décode avec ffmpeg. 10 s : 511 trames, 0 perte ; **écoute validée par l'utilisateur**.
+  (Le champ « taille » de l'en-tête des trames compte désormais des octets, dans les deux modes.)
+
 ## Phase 5 — Intégration complète, un seul canal d'abord
 
 **Objectif** : brancher audio réel → encodeur → BLE, sur une seule aide, en continu.

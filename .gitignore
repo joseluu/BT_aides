@@ -24,3 +24,4 @@ pcm1808_esp32/
 
 # Captures audio de test (regenerables avec firmware_i2s_test/tools/capture_wav.py)
 *.wav
+*.g722

@@ -38,6 +38,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "dsps_fir.h"
 #include "fir_48k_16k.h"
+#include "g722_encoder.h"
 
 static const char *TAG = "i2s_test";
 
@@ -64,9 +65,59 @@ static const char *TAG = "i2s_test";
 static const uint8_t STREAM_MAGIC[4] = {0xA5, 0x5A, 0xC3, 0x3C};
 #define STREAM_HEADER_LEN    8
 
+/* G.722 64 kbit/s : 320 echantillons a 16 kHz (20 ms) -> 160 octets, soit une
+ * trame ASHA. */
+#define G722_FRAME_SAMPLES   320
+#define G722_FRAME_BYTES     160
+
 /* Ligne a retard du FIR : N + 4 et alignee sur 16 octets (exigence de la
  * version ESP32-S3 optimisee de dsps_fird_f32). */
 static float s_fir_delay[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
+
+/* CRC32 compatible zlib.crc32(), pour comparer avec la reference PC. */
+static uint32_t
+crc32_zlib(const uint8_t *buf, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+/* Encode un signal entier deterministe (triangle + bruit pseudo-aleatoire)
+ * et compare le CRC32 du resultat a celui calcule sur PC avec libg722
+ * (bindings Python, verifies bit-exacts avec ffmpeg). Mesure aussi le cout. */
+#define G722_TEST_SAMPLES    3200
+#define G722_TEST_CRC        0x3705e003u
+static void
+g722_self_test(void)
+{
+    static int16_t pcm[G722_TEST_SAMPLES];
+    static uint8_t enc[G722_TEST_SAMPLES / 2];
+    uint32_t seed = 12345;
+    for (int n = 0; n < G722_TEST_SAMPLES; n++) {
+        seed = seed * 1103515245u + 12345u;
+        int noise = (int)((seed >> 16) & 0x7FFF) - 16384;
+        int p = n % 64;
+        int tri = (p < 32) ? (p * 1000 - 16000) : ((63 - p) * 1000 - 16000);
+        pcm[n] = (int16_t)(tri / 2 + (noise >> 2)); /* >> 2 = division Python // 4 */
+    }
+    G722_ENC_CTX *enc_ctx = g722_encoder_new(64000, 0);
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    int len = g722_encode(enc_ctx, pcm, G722_TEST_SAMPLES, enc);
+    uint32_t cycles = esp_cpu_get_cycle_count() - t0;
+    g722_encoder_destroy(enc_ctx);
+    uint32_t crc = crc32_zlib(enc, len);
+    double cpu_pct = 100.0 * cycles / (G722_TEST_SAMPLES / 16000.0 * CPU_HZ);
+    ESP_LOGI(TAG, "auto-test G.722 : %d octets, crc32=0x%08" PRIx32 " (attendu 0x%08" PRIx32 ") %s,"
+             " premiers %02x%02x%02x%02x, cout %.2f %% CPU",
+             len, crc, G722_TEST_CRC, crc == G722_TEST_CRC ? "OK" : "ECHEC",
+             enc[0], enc[1], enc[2], enc[3], cpu_pct);
+}
 
 static double
 to_dbfs(double v)
@@ -114,6 +165,19 @@ fir_self_test(void)
     }
 }
 
+/* Complete l'en-tete (magic, sequence, taille de la charge utile en octets)
+ * et envoie la trame sur l'USB-Serial/JTAG. */
+static void
+send_frame(uint8_t *frame, uint16_t seq, int payload_len)
+{
+    memcpy(frame, STREAM_MAGIC, 4);
+    frame[4] = seq & 0xff;
+    frame[5] = seq >> 8;
+    frame[6] = payload_len & 0xff;
+    frame[7] = payload_len >> 8;
+    usb_serial_jtag_write_bytes(frame, STREAM_HEADER_LEN + payload_len, pdMS_TO_TICKS(20));
+}
+
 static void
 i2s_capture_task(void *arg)
 {
@@ -157,10 +221,15 @@ i2s_capture_task(void *arg)
 
     usb_serial_jtag_driver_config_t usb_cfg = {.tx_buffer_size = 4096, .rx_buffer_size = 256};
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
-    bool streaming = false;
+    char stream_mode = 0; /* 0 = logs texte, 'S' = PCM 16 kHz, 'G' = trames G.722 */
     uint16_t stream_seq = 0;
-    static uint8_t frame[STREAM_HEADER_LEN + OUT_PER_READ * 2];
-    ESP_LOGI(TAG, "Envoyer 'S' sur le port USB pour demarrer le flux audio 16 kHz (binaire)");
+    static uint8_t frame[STREAM_HEADER_LEN + G722_FRAME_SAMPLES * 2];
+    G722_ENC_CTX *g722 = g722_encoder_new(64000, 0);
+    static int16_t pcm16[G722_FRAME_SAMPLES];
+    int pcm16_count = 0;
+    uint64_t g722_cycles = 0;
+    ESP_LOGI(TAG, "Envoyer 'S' (PCM 16 kHz) ou 'G' (trames G.722 de 20 ms) sur le port USB"
+             " pour demarrer un flux binaire");
 
     /* static plutot que sur la pile : un premier essai avec une pile de tache
      * de 4096 octets et le buffer brut en automatique a provoque un stack
@@ -215,41 +284,54 @@ i2s_capture_task(void *arg)
         }
         frames16 += nout;
 
-        if (!streaming) {
+        for (int j = 0; j < nout; j++) {
+            float v = out16[j] * 32767.0f;
+            pcm16[pcm16_count++] = (int16_t)lrintf(v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v));
+            if (pcm16_count == G722_FRAME_SAMPLES) {
+                pcm16_count = 0;
+                uint32_t g0 = esp_cpu_get_cycle_count();
+                uint8_t *g722_out = frame + STREAM_HEADER_LEN;
+                uint8_t g722_buf[G722_FRAME_BYTES];
+                int nbytes = g722_encode(g722, pcm16, G722_FRAME_SAMPLES,
+                                         stream_mode == 'G' ? g722_out : g722_buf);
+                g722_cycles += esp_cpu_get_cycle_count() - g0;
+                if (stream_mode == 'G') {
+                    send_frame(frame, stream_seq++, nbytes);
+                }
+            }
+        }
+
+        if (stream_mode == 0) {
             uint8_t c;
-            if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1 && c == 'S') {
-                ESP_LOGI(TAG, "Flux audio demarre, logs coupes");
+            if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1 && (c == 'S' || c == 'G')) {
+                ESP_LOGI(TAG, "Flux '%c' demarre, logs coupes", c);
                 vTaskDelay(pdMS_TO_TICKS(20));
                 esp_log_level_set("*", ESP_LOG_NONE);
-                streaming = true;
+                stream_mode = (char)c;
             }
-        } else {
-            memcpy(frame, STREAM_MAGIC, 4);
-            frame[4] = stream_seq & 0xff;
-            frame[5] = stream_seq >> 8;
-            frame[6] = nout & 0xff;
-            frame[7] = nout >> 8;
+        } else if (stream_mode == 'S') {
             for (int j = 0; j < nout; j++) {
                 float v = out16[j] * 32767.0f;
                 int32_t q = (int32_t)lrintf(v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v));
                 frame[STREAM_HEADER_LEN + 2 * j] = q & 0xff;
                 frame[STREAM_HEADER_LEN + 2 * j + 1] = (q >> 8) & 0xff;
             }
-            usb_serial_jtag_write_bytes(frame, STREAM_HEADER_LEN + 2 * nout, pdMS_TO_TICKS(20));
-            stream_seq++;
+            send_frame(frame, stream_seq++, 2 * nout);
         }
 
-        if (++block_count >= PRINT_PERIOD_BLOCKS && !streaming) {
+        if (++block_count >= PRINT_PERIOD_BLOCKS && stream_mode == 0) {
             double cpu_pct = 100.0 * fir_cycles / (frames48 / (double)I2S_SAMPLE_RATE_HZ * CPU_HZ);
             ESP_LOGI(TAG, "48 kHz: pic %.1f rms %.1f dBFS clip %" PRIu32 " | 16 kHz: pic %.1f rms %.1f dBFS"
-                     " (%" PRIu32 " ech.) | FIR %.2f %% CPU",
+                     " (%" PRIu32 " ech.) | FIR %.2f %% CPU | G.722 %.2f %% CPU",
                      to_dbfs(peak48), to_dbfs(sqrt(sum_sq48 / frames48)), clip_count,
-                     to_dbfs(peak16), to_dbfs(sqrt(sum_sq16 / frames16)), frames16, cpu_pct);
+                     to_dbfs(peak16), to_dbfs(sqrt(sum_sq16 / frames16)), frames16, cpu_pct,
+                     100.0 * g722_cycles / (frames48 / (double)I2S_SAMPLE_RATE_HZ * CPU_HZ));
             sum_sq48 = sum_sq16 = 0.0;
             peak48 = peak16 = 0.0f;
             clip_count = 0;
             frames48 = frames16 = 0;
             fir_cycles = 0;
+            g722_cycles = 0;
             block_count = 0;
         }
     }
@@ -259,5 +341,6 @@ void
 app_main(void)
 {
     fir_self_test();
+    g722_self_test();
     xTaskCreate(i2s_capture_task, "i2s_capture", 8192, NULL, 10, NULL);
 }
