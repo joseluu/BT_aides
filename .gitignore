@@ -5,6 +5,9 @@ sdkconfig.xiao_esp32c3
 sdkconfig.esp32s3_com12
 sdkconfig.test_client_s3
 sdkconfig.test_server_s3
+sdkconfig.esp32s3_i2s_test
+# Composants ESP-IDF telecharges par le gestionnaire (voir dependencies.lock)
+managed_components/
 
 # Bug reports Android bruts (volumineux, potentiellement sensibles) —
 # seul btsnoop_hci.log extrait a servi de reference protocolaire, deja
@@ -15,3 +18,6 @@ bug_report_HCI_monaural/
 # Captures sniffer BLE / logs serie de sessions de debug (volumineux,
 # reproductibles a la demande, pas necessaires en historique git)
 sniffs/
+
+# Depot public separe (github.com/joseluu/pcm1808_esp32)
+pcm1808_esp32/

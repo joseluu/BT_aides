@@ -512,6 +512,126 @@ projet est leve.
 
 **Objectif** : capter proprement l'audio TV et le préparer pour l'encodage, indépendamment du BLE.
 
+**Câblage I2S fait (2026-10-04)** : breakout ADC PCM1808 connecté à la carte définitive du projet,
+un **ESP32-S3 Supermini** (broches sérigraphiées par numéro de GPIO direct, pas un XIAO).
+
+| PCM1808 | ESP32-S3 Supermini | Sens |
+|---|---|---|
+| MCLK (SCKI) | — | **Non connecté** : le breakout a son propre quartz 24,576 MHz ; ce fil, voisin de BCK dans la nappe, perturbait BCK par diaphonie (GPIO4 libre) |
+| BCLK (BCK) | GPIO5 | PCM1808 → ESP32 (6,144 MHz, PCM1808 maître) |
+| LRCK (WS) | GPIO6 | PCM1808 → ESP32 (fs = 96 kHz) |
+| DATA (DOUT) | GPIO7 | PCM1808 → ESP32 (RX) |
+| GND | GND | commun |
+| VCC | 5V | Breakout alimenté en 5V (VCC analogique du PCM1808 = 4.5-5.5V) ; régulateur intégré → VDD numérique mesuré à 3.3V, donc sorties logiques sûres pour l'ESP32-S3 |
+
+GPIO choisis pour éviter les pins de strapping (0/3/45/46), l'USB natif (19/20) et l'UART0 (43/44).
+Firmware : I2S **esclave**, RX seul, format Philips/standard — le breakout est câblé en mode maître (voir « RÉSOLU » plus bas).
+FMT/MD du PCM1808 supposés déjà strappés en I2S standard sur ce breakout (non vérifié explicitement).
+
+### Firmware de test I2S créé et premier essai en direct (2026-10-04)
+
+**Projet séparé** `firmware_i2s_test/` (même convention que `firmware_test_server/` et
+`firmware_test_client/` des phases précédentes) — garde `firmware/` (Phase 2, validé) intact.
+Driver `driver/i2s_std.h` (ESP-IDF 5.5.2, composant `esp_driver_i2s`), capture en maître I2S,
+16 kHz natif (pas de rééchantillonnage logiciel), Philips stéréo 32 bits/slot, extraction de
+l'échantillon 24 bits signé par `>> 8` sur chaque mot brut. Affiche un niveau peak/RMS en dBFS
+toutes les ~0.5s — couvre le critère de sortie alternatif "mesure au niveau du signal numérique".
+
+**Carte physique** : même ESP32-S3 Supermini que `firmware/` (COM12), mais réapparaît sous un
+port COM différent après reflash/replug — ici **COM15** (comportement déjà documenté : le port
+change à chaque rebranchement). `esptool flash_id` confirme la puce : ESP32-S3 (QFN56 v0.2),
+**flash embarquée 4MB** (pas 8MB comme le board PlatformIO `esp32-s3-devkitc-1` le suppose par
+défaut — corrigé via `board_build.flash_size = 4MB` dans `platformio.ini`), **PSRAM embarquée
+2MB**, mode natif **USB-Serial/JTAG** (VID/PID `303A:1001`, pas de puce pont UART externe — c'est
+la signature caractéristique d'un vrai "Supermini").
+
+**Bug trouvé et corrigé avant le premier essai concluant** : la tâche de capture créée avec une
+pile de seulement 4096 octets faisait un **stack overflow** (buffer brut de 2 Ko + profondeur
+d'appel de l'init du driver I2S + un `printf`) — corrompait silencieusement le tas, crash
+retardé et sans rapport apparent observé dans le idle task watchdog (`LoadProhibited` dans
+`find_entry_from_task_handle_and_check_all_reset`, résolu via `addr2line` sur le `.elf`).
+**Corrigé** : buffer rendu `static` (sort de la pile) + pile de la tâche portée à 8192 octets.
+Plus aucun crash après correctif, capture tourne en continu.
+
+**Premier essai en direct — résultat suspect, pas encore concluant** : le niveau mesuré reste
+bloqué en permanence près de la pleine échelle (peak ≈ -0.0 dBFS à chaque bloc, RMS ≈ -8 dBFS,
+sur plusieurs secondes consécutives), alors qu'aucune source audio n'était branchée côté PCM1808
+à ce stade. Le dump des premiers mots bruts montre des valeurs incohérentes d'un échantillon à
+l'autre (octet de poids fort très variable : `0x82`, `0x1a`, `0x9e`, `0x00`...), ce qui ne
+ressemble ni à du silence propre (devrait rester proche de 0x00/0xFF) ni à un vrai signal audio
+structuré. **Hypothèse principale : DATA (GPIO7) non effectivement raccordé ou PCM1808 non
+alimenté** — une entrée flottante sur l'ESP32 capterait du bruit incohérent de ce type.
+**Test de diagnostic prioritaire pour la prochaine session** : vérifier au multimètre que le
+PCM1808 est bien sous 3.3V, puis court-circuiter temporairement les entrées analogiques L/R du
+PCM1808 à la masse — si le niveau mesuré ne descend pas vers un vrai silence (dBFS très négatif),
+le problème est côté câblage/alimentation, pas côté code firmware (le driver I2S lui-même tourne
+sans erreur ni crash).
+
+### Diagnostic au scope TDS784A (2026-10-05) — cause trouvée : quartz 24,576 MHz sur le breakout
+
+Mesures au scope (CH1=MCLK, CH2=BCK, CH3=LRCK, CH4=DATA, captures analysées point par point) :
+- BCK propre, 1,024 MHz. Mais DATA changeait sur une grille fixe de **163 ns** (≈ 6,144 MHz),
+  à des instants sans rapport avec BCK — **et cette grille n'a pas bougé quand le MCLK de
+  l'ESP32 est passé de 6,144 à 4,096 MHz**. DATA était donc cadencée par une autre horloge.
+- Cause : **le breakout a son propre quartz 24,576 MHz** (confirmé visuellement) qui attaque
+  SCKI. L'ESP32 pilotait la broche MCLK du connecteur, vraisemblablement contre cet oscillateur
+  (niveaux étalés sur CH1), et ses BCK/LRCK n'étaient pas synchrones du SCKI réel → sortie du
+  PCM1808 incohérente. Ça explique a posteriori tous les symptômes (niveaux bloqués quel que
+  soit le volume, motifs répétitifs, aucun effet des ratios MCLK).
+- Pièges de mesure rencontrés : pinces de masse des sondes non reliées (signaux centrés sur 0 V),
+  sondes x10 non reconnues sur CH2/CH4 (échelle /10 manuelle). Voir skill `scope`.
+
+**Correction** (`firmware_i2s_test`) : GPIO4 en **entrée**, source d'horloge I2S externe
+(`I2S_CLK_SRC_EXTERNAL`, 24 576 000 Hz), **fs = 48 kHz** (512 fs ; 16 kHz impossible avec ce
+quartz, le PCM1808 esclave n'acceptant que 256/384/512 fs), BCK = 3,072 MHz. La décimation
+48 → 16 kHz (passe-bas + 1 échantillon sur 3) devient une étape logicielle de la Phase 3.
+Attention : sans horloge présente sur GPIO4, `i2s_channel_enable()` boucle indéfiniment
+(attente de `i2s_ll_rx_update`) et le task watchdog se déclenche — à garder en tête si le
+breakout est débranché. **Pas encore testé avec le breakout branché.**
+
+### RÉSOLU (2026-10-05) — PCM1808 en mode maître, ESP32 esclave I2S
+
+La correction « horloge externe 48 kHz » ci-dessus n'était qu'une étape : en la testant, la cadence
+mesurée était juste mais chaque mot de 32 bits contenait deux valeurs de 16 bits voisines (lecture
+d'un bit sur deux d'un flux deux fois plus rapide). Recoupé avec la grille de 163 ns vue au scope
+(24,576 MHz / 4 = 6,144 MHz) : **le breakout est câblé en mode MAÎTRE 256 fs** (MD0/MD1 à 1,
+non exposés). C'est le PCM1808 qui génère BCK = 6,144 MHz et LRCK = fs = **96 kHz** ; toutes les
+configurations précédentes pilotaient ces lignes contre lui (d'où les « niveaux multiples » sur LRCK).
+
+**Configuration validée** (`firmware_i2s_test`) : `I2S_ROLE_SLAVE`, BCK (GPIO5) et LRCK (GPIO6) en
+entrées, DATA (GPIO7), MCLK non utilisé, fs = 96 kHz, Philips stéréo 32 bits/slot, `>> 8`.
+
+**Second problème, matériel** : avec BCK à 6,144 MHz, le fil MCLK de la nappe (24,576 MHz du quartz,
+voisin de BCK) corrompait BCK par diaphonie — un essai a perdu la synchro (blocs à 1,3-1,6 s au
+lieu de 0,5 s, valeurs figées). **Fil MCLK débranché → stable.**
+
+**Résultats** : silence = RMS -95 dBFS / pic -81 dBFS (bruit de fond normal d'un ADC 24 bits) ;
+musique à 10 % sur la prise casque d'un PC = RMS -44 à -47 dBFS, pic ≈ -36 dBFS, sans écrêtage ;
+20 s consécutives sans aucun bloc corrompu, cadence exacte (48 128 échantillons / ~505 ms).
+
+**Options du breakout** (sérigraphie au dos, photo dans le dépôt public) : OP2/OP3 ouverts =
+maître 96 kHz (usine) ; OP2 court-circuité = maître 48 kHz ; OP2+OP3 = esclave. OP1 ouvert = I2S
+24 bits, court-circuité = cadré à gauche. **Choix : maître 48 kHz (pont OP2 soudé), validé** —
+BCK 3,072 MHz, silence -92 dBFS, musique à 50 % = -23 à -30 dBFS RMS sans écrêtage, cadence
+exacte. Niveau vérifié comme suivant le volume (10 % → 50 % : +12 à +20 dB).
+
+**Dépôt public** de cette base de capture (firmware + README détaillé + photos) :
+https://github.com/joseluu/pcm1808_esp32 (copie locale `BT_aides/pcm1808_esp32/`, exclue du dépôt
+principal).
+
+**Décimation 48 → 16 kHz : faite et validée (2026-10-05).** FIR equiripple de 80 coefficients
+(`scipy.signal.remez`, table `firmware_i2s_test/main/fir_48k_16k.h`) : bande passante 0-7 kHz
+(ondulation 0,05 dB), bande coupée ≥ 9 kHz (≥ 70 dB). La bande 8-9 kHz se replie entre 7 et 8 kHz,
+hors de la bande utile du G.722, ce qui évite les ~200 coefficients qu'exigerait une coupure à
+8 kHz. Exécuté par `dsps_fird_f32` d'ESP-DSP (composant géré `espressif/esp-dsp`, version
+optimisée S3 : coefficients multiples de 4, tableaux alignés sur 16 octets ; `len` = nombre
+d'échantillons de SORTIE). Auto-test au démarrage sur sinusoïdes synthétiques : 0,0 dB à 1/5/7 kHz,
+-1,8 dB à 7,5 kHz, -70,5 dB à 9 kHz, -82 dB à 10 kHz. Sur musique : RMS à 16 kHz 0,1-0,6 dB sous
+celui à 48 kHz, sans écrêtage. Coût : 1,9 % CPU à 160 MHz, retard 0,8 ms.
+
+**Reste pour clore la Phase 3** : export du flux 16 kHz vers le PC pour écoute (binaire sur
+l'USB-série + script Python → WAV).
+
 - Câblage et configuration de l'ADC I2S externe choisi (cf. architecture §2.2).
 - Capture I2S continue, vérification du signal (par ex. dump vers fichier/UART pour écoute externe,
   ou mesure au niveau du signal numérique).
