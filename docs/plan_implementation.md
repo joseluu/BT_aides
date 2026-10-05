@@ -696,6 +696,46 @@ et vérifié hors BLE, réécouté sur PC.
 **Critère de sortie** : audio TV entendu clairement et en continu sur une aide, qualité jugée
 acceptable par l'utilisateur.
 
+### Avancement (2026-10-05)
+
+Chaîne intégrée dans `firmware/` : `audio_capture.c` (I2S esclave 48 kHz → FIR 48→16 kHz → G.722,
+cœur 1) alimente une file de trames ; `asha_audio_stream_task` les envoie sur le canal CoC. **Son
+continu et propre entendu dans l'aide** (source téléphone, breakout éloigné de l'antenne).
+
+Problèmes trouvés et corrigés en route :
+
+1. **`BLE_HS_ESTALLED` mal traité** (cause des « 1 s de son toutes les 5 s ») : dans NimBLE,
+   ESTALLED veut dire *trame acceptée*, envoyée dès que l'aide rend des crédits
+   (`ble_l2cap_coc_continue_tx`). L'ancien code la renvoyait (→ EBUSY) puis la libérait alors que
+   NimBLE la détenait encore → canal corrompu, réouvert en boucle. Corrigé : après ESTALLED, attendre
+   `BLE_L2CAP_EVENT_COC_TX_UNSTALLED` (sémaphore) avant la trame suivante ; canal déclaré bloqué
+   seulement après 1 s sans crédit.
+2. **Ne jamais jeter une trame G.722 encodée** : le codage est différentiel, le décodeur de l'aide
+   divergerait (le numéro de séquence restant continu, elle n'est pas prévenue). Si la file (6
+   trames = 120 ms) est pleine, on saute 20 ms de PCM *avant* l'encodage.
+3. **Scan figé quand personne ne lit l'USB** : le log du scan (1 ligne / 20 annonces) bloquait la
+   tâche hôte NimBLE sur l'écriture console. Log ramené à 1 ligne / 1000 annonces.
+4. **Reconnexion après perte de lien** : la liste blanche ne retrouvait pas l'aide après un
+   éteindre/rallumer → retour au scan actif (la liste blanche reste utilisée au démarrage, où elle
+   fonctionne).
+5. **Brouillage radio par le breakout** : breakout + nappe près de l'antenne du Supermini → ~500
+   attentes de crédits en 45 s et coupures ; éloigné à 30 cm → aucune. Harmoniques du quartz
+   24,576 MHz (98e–100e dans la bande BLE) et de BCK 3,072 MHz.
+6. **Ronflement = boucle de masse par le PC** : en pause, -54 dBFS pendant le flux contre -66 sans
+   flux (source PC), et **-69 dBFS avec un téléphone sur batterie comme source**. Les rafales radio
+   toutes les 20 ms (50 Hz) font circuler un courant dans la masse USB, qui s'ajoute au signal du
+   jack référencé au PC. Ni le firmware ni le breakout en cause (ancien firmware testé : même
+   ronflement). **À traiter pour la TV** : alimentation USB indépendante non reliée à la terre,
+   isolateur de boucle de masse / transformateur audio, ou entrée optique.
+7. **Supermini n°1 (MAC FC:01:2C:C3:74:64) défectueux** : 64,9 °C stabilisé seul sur USB contre
+   52,5 °C pour le n°2 (même puce 4 Mo + PSRAM 2 Mo). Cause probable : conflits de bus des premiers
+   essais Phase 3 (l'ESP32 pilotait MCLK/BCK/LRCK contre le PCM1808 maître). Remplacé par le n°2
+   (MAC 50:78:7D:19:B7:24, re-appairé avec l'aide). Tâche de log de la température puce (5 s)
+   ajoutée au firmware.
+
+Reste pour clore la Phase 5 : test continu de plusieurs minutes validé par l'écoute, puis essai
+avec la vraie source TV (en traitant la boucle de masse).
+
 ## Phase 6 — Duplication sur les deux oreillettes + orchestration
 
 **Objectif** : le système complet tel que décrit dans l'architecture.
