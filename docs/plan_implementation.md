@@ -629,8 +629,16 @@ d'échantillons de SORTIE). Auto-test au démarrage sur sinusoïdes synthétique
 -1,8 dB à 7,5 kHz, -70,5 dB à 9 kHz, -82 dB à 10 kHz. Sur musique : RMS à 16 kHz 0,1-0,6 dB sous
 celui à 48 kHz, sans écrêtage. Coût : 1,9 % CPU à 160 MHz, retard 0,8 ms.
 
-**Reste pour clore la Phase 3** : export du flux 16 kHz vers le PC pour écoute (binaire sur
-l'USB-série + script Python → WAV).
+**Export vers le PC : fait (2026-10-05).** À la réception de `S` sur l'USB-Serial/JTAG, le firmware
+coupe ses logs et envoie le flux 16 kHz en binaire (trames de 5 ms : magic `A5 5A C3 3C`,
+séquence uint16, nombre d'échantillons uint16, puis int16 LE). `firmware_i2s_test/tools/capture_wav.py`
+(uv + pyserial) ouvre le port sans DTR/RTS (sinon reset de la carte), envoie `S`, vérifie la
+séquence et écrit un WAV. 10 s de musique : 2023 trames, 0 perte, 0 resynchronisation ; spectre
+cohérent (rien de continu, contenu jusqu'à 7 kHz) ; **écoute jugée propre par l'utilisateur**.
+Piège : `usb_serial_jtag_driver_install()` refuse un buffer RX ≤ 64 octets.
+
+**Phase 3 : TERMINÉE (2026-10-05).** Critère de sortie atteint : flux PCM 16 kHz mono propre, extrait
+et vérifié hors BLE, réécouté sur PC.
 
 - Câblage et configuration de l'ADC I2S externe choisi (cf. architecture §2.2).
 - Capture I2S continue, vérification du signal (par ex. dump vers fichier/UART pour écoute externe,
