@@ -736,6 +736,36 @@ Problèmes trouvés et corrigés en route :
 Reste pour clore la Phase 5 : test continu de plusieurs minutes validé par l'écoute, puis essai
 avec la vraie source TV (en traitant la boucle de masse).
 
+### Validation sur une seconde paire d'aides (2026-10-09)
+
+Objectif : vérifier que le firmware n'est pas calé sur la paire principale. Option de compilation
+`ASHA_TARGET_PAIR` dans `main.c` (1 = paire principale, 2 = paire secondaire, **défaut 1**) ;
+à 2, pas d'auto-connect au démarrage vers les bonds existants (scan + filtre HiSyncId).
+
+- **Identification** (sniffer en scan + log ESP32, off/on aide par aide) : annonce ASHA
+  `01 02 34 44 43 31` (gauche) / `01 03 34 44 43 31` (droite), HiSyncId complet
+  `9502464234444331`, codec G.722 (`codecs=0x0002`). Adresses **privées tournantes** (changent
+  toutes les 1-2 min : `70:d8:18:02:e8:bf` -> `4c:7f:83:b4:ac:02` en cours d'annonce) — seul le
+  HiSyncId identifie la paire, ne jamais filtrer par adresse.
+- **Droite puis gauche : connexion, bonding Just Works, CoC (PSM 0x0080, peer_mtu 248), START
+  acquitté et son entendu, du premier coup** — aucune adaptation protocolaire nécessaire.
+- Parasites entendus = rafales d'attentes de crédits CoC + trames PCM sautées (liaison faible) ;
+  coupure vers 4 m.
+- **Bug trouvé et corrigé (commit `51a36a7`)** : à la perte de lien, `COC_DISCONNECTED` (tâche
+  hôte) remettait `coc_chan` à NULL pendant un `ble_l2cap_send()` de la tâche audio -> Guru
+  Meditation `LoadProhibited` (EXCVADDR 0x38 = `&chan->coc_tx`) et reboot ; l'aide ne
+  ré-annonçant pas, aucune reconnexion possible. Mutex récursif autour de chaque envoi et de la
+  remise à NULL. **Pas encore vérifié en direct** (pas de nouvelle perte de lien après le flash).
+- Gel de la sortie USB de l'ESP32 observé une fois (plus rien sur le port, esptool ne répond
+  plus, radio toujours active) -> RESET manuel. Cause non établie ; un reboot spontané plus tôt
+  dans la session relève peut-être du bug ci-dessus.
+- **Bonds NVS** : `CONFIG_BT_NIMBLE_MAX_BONDS=3` et l'ESP32 s'est appairé aux deux aides de
+  la paire secondaire -> le bond de la paire principale a probablement été évincé, et au démarrage (cible 1)
+  l'auto-connect par liste blanche prend `bonded_peers[0]`, qui peut maintenant être une aide de
+  la paire secondaire. **Au prochain essai avec la paire principale : effacer la flash (`pio run -t erase`)
+  avant l'upload**, puis laisser le premier contact se faire par scan + HiSyncId (re-appairage
+  automatique).
+
 ## Phase 6 — Duplication sur les deux oreillettes + orchestration
 
 **Objectif** : le système complet tel que décrit dans l'architecture.

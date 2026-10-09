@@ -187,6 +187,27 @@ asha_send_stop(void)
  * (faute de credits) est partie, on peut envoyer la suivante. */
 static SemaphoreHandle_t s_tx_unstalled;
 
+/* coc_chan est remis a NULL par la tache hote NimBLE (COC_DISCONNECTED)
+ * pendant que la tache audio s'en sert : sans verrou, ble_l2cap_send(NULL)
+ * -> LoadProhibited a l'adresse 0x38 (&chan->coc_tx), observe en direct le
+ * 2026-10-09 a la perte de portee. Ce mutex couvre chaque envoi et la remise
+ * a NULL ; il n'est jamais tenu pendant une attente. Recursif : au cas ou
+ * NimBLE rappellerait COC_DISCONNECTED dans la tache appelante. */
+static SemaphoreHandle_t s_coc_chan_mutex;
+
+/* Envoie sdu sur coc_chan s'il existe encore. BLE_HS_ENOTCONN si le canal a
+ * disparu (sdu non consomme, a liberer par l'appelant). */
+static int
+asha_coc_send_locked(struct os_mbuf *sdu)
+{
+    int rc;
+
+    xSemaphoreTakeRecursive(s_coc_chan_mutex, portMAX_DELAY);
+    rc = (coc_chan != NULL) ? ble_l2cap_send(coc_chan, sdu) : BLE_HS_ENOTCONN;
+    xSemaphoreGiveRecursive(s_coc_chan_mutex);
+    return rc;
+}
+
 static void
 asha_audio_stream_task(void *arg)
 {
@@ -237,7 +258,11 @@ asha_audio_stream_task(void *arg)
                 MODLOG_DFLT(ERROR, "ASHA: credits CoC non rendus depuis 1 s —"
                             " fermeture/reouverture du canal (connexion GAP conservee)\n");
                 channel_stuck = true;
-                ble_l2cap_disconnect(coc_chan);
+                xSemaphoreTakeRecursive(s_coc_chan_mutex, portMAX_DELAY);
+                if (coc_chan != NULL) {
+                    ble_l2cap_disconnect(coc_chan);
+                }
+                xSemaphoreGiveRecursive(s_coc_chan_mutex);
                 break;
             }
             if (coc_chan == NULL) {
@@ -270,10 +295,15 @@ asha_audio_stream_task(void *arg)
          * renvoyer ni la liberer, seulement attendre TX_UNSTALLED avant la
          * suivante. EBUSY = trame refusee (une autre est encore en cours) : on
          * retente brievement, puis on la libere. */
-        rc = ble_l2cap_send(coc_chan, sdu);
+        rc = asha_coc_send_locked(sdu);
         for (int retry = 0; rc == BLE_HS_EBUSY && retry < 20; retry++) {
             vTaskDelay(5 / portTICK_PERIOD_MS);
-            rc = ble_l2cap_send(coc_chan, sdu);
+            rc = asha_coc_send_locked(sdu);
+        }
+        if (rc == BLE_HS_ENOTCONN) {
+            /* Canal ferme pendant l'envoi (deconnexion) : fin du flux. */
+            os_mbuf_free_chain(sdu);
+            break;
         }
         if (rc == BLE_HS_ESTALLED) {
             stalled = true;
@@ -288,7 +318,11 @@ asha_audio_stream_task(void *arg)
                             " fermeture/reouverture du canal (connexion GAP conservee)\n",
                             consecutive_failures);
                 channel_stuck = true;
-                ble_l2cap_disconnect(coc_chan);
+                xSemaphoreTakeRecursive(s_coc_chan_mutex, portMAX_DELAY);
+                if (coc_chan != NULL) {
+                    ble_l2cap_disconnect(coc_chan);
+                }
+                xSemaphoreGiveRecursive(s_coc_chan_mutex);
                 break;
             }
         } else {
@@ -595,7 +629,9 @@ blecent_l2cap_coc_event_cb(struct ble_l2cap_event *event, void *arg)
     case BLE_L2CAP_EVENT_COC_DISCONNECTED:
         console_printf("LE CoC disconnected, chan: %p\n",
                        event->disconnect.chan);
+        xSemaphoreTakeRecursive(s_coc_chan_mutex, portMAX_DELAY);
         coc_chan = NULL;
+        xSemaphoreGiveRecursive(s_coc_chan_mutex);
         g_asha_state = ASHA_STATE_IDLE;
         if (s_tx_unstalled != NULL) {
             xSemaphoreGive(s_tx_unstalled);
@@ -763,7 +799,19 @@ ext_blecent_should_connect(const struct ble_gap_ext_disc_desc *disc)
 /* HiSyncId tronque (4 octets de poids faible) de la paire Signia ciblee — voir
  * docs/protocole_asha_reference.md paragraphe 2 et 6. Sert a ne se connecter qu'a
  * l'une de nos deux aides, pas a un autre appareil ASHA qui traînerait a proximite. */
+/* Paire ciblee, choisie a la compilation : 1 = paire principale (HiSyncId
+ * 30454345), 2 = paire secondaire (HiSyncId complet 9502464234444331, gauche
+ * capability 0x02, droite 0x03 ; validee en direct le 2026-10-09). Les adresses
+ * de ces aides sont des adresses privees qui tournent en 1-2 min : seul le
+ * HiSyncId identifie la paire. */
+#ifndef ASHA_TARGET_PAIR
+#define ASHA_TARGET_PAIR 1
+#endif
+#if ASHA_TARGET_PAIR == 2
+static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x34, 0x44, 0x43, 0x31};
+#else
 static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x30, 0x45, 0x43, 0x45};
+#endif
 
 static int
 blecent_should_connect(const struct ble_gap_disc_desc *disc)
@@ -1156,7 +1204,10 @@ blecent_on_sync(void)
     int num_bonded = 0;
     rc = ble_store_util_bonded_peers(bonded_peers, &num_bonded,
                                       sizeof(bonded_peers) / sizeof(bonded_peers[0]));
-    if (rc == 0 && num_bonded > 0) {
+    /* Les bonds en NVS appartiennent a la paire principale : pas d'auto-connect
+     * au demarrage quand on cible la paire secondaire (scan + filtre HiSyncId
+     * a la place). Les bonds sont conserves, pas effaces. */
+    if (rc == 0 && num_bonded > 0 && ASHA_TARGET_PAIR == 1) {
         g_asha_peer_addr = bonded_peers[0];
         g_asha_peer_addr_known = true;
         rc = ble_gap_wl_set(&g_asha_peer_addr, 1);
@@ -1220,6 +1271,9 @@ app_main(void)
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);
+
+    s_coc_chan_mutex = xSemaphoreCreateRecursiveMutex();
+    assert(s_coc_chan_mutex != NULL);
 
     ret = nimble_port_init();
     assert(ret == 0);

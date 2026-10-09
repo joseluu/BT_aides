@@ -21,7 +21,7 @@ import serial
 MAGIC = bytes([0xA5, 0x5A, 0xC3, 0x3C])
 HEADER_LEN = 8
 RATE = 16000
-DEFAULT_FFMPEG = os.path.expandvars(r"%USERPROFILE%\softs_portable\ffmpeg\bin\ffmpeg.exe")
+DEFAULT_FFMPEG = os.path.join(os.path.expanduser("~"), "softs_portable", "ffmpeg", "bin", "ffmpeg.exe")
 
 
 def read_stream(port, duration, command):
