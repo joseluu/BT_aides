@@ -10,8 +10,13 @@
  * - Decimation par 3 : FIR 80 coefficients (fir_48k_16k.h) via ESP-DSP.
  * - G.722 64 kbit/s : libg722 (components/g722), bit-exact avec ffmpeg.
  *
- * Les trames sont deposees dans une file : c'est l'horloge du quartz audio qui
- * cadence l'envoi ASHA. Si la file deborde (dérive entre le quartz audio et
+ * Stereo : voies gauche et droite decimees et encodees separement (une aide
+ * par oreille, meme numero de sequence, contenu different - comme Android).
+ * En mode mono (une seule aide connectee), les deux encodeurs recoivent le
+ * melange (G+D)/2, fait apres decimation (le filtre est lineaire).
+ *
+ * Les paires de trames {G, D} sont deposees dans une file : c'est l'horloge du
+ * quartz audio qui cadence l'envoi ASHA. Si la file deborde (dérive entre le quartz audio et
  * l'horloge BLE, ou congestion radio), la trame la plus ancienne est jetee.
  */
 
@@ -45,14 +50,34 @@ static const char *TAG = "audio";
 
 static QueueHandle_t s_frames;
 static volatile bool s_restart_requested;
+static volatile bool s_stereo_requested;
 
 /* Tableaux alignes sur 16 octets : exigence de la version ESP32-S3 de
  * dsps_fird_f32. Statiques : pas sur la pile de la tache. */
-static float s_fir_delay[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
-static float s_mono48[FRAMES_PER_READ] __attribute__((aligned(16)));
-static float s_out16[OUT_PER_READ] __attribute__((aligned(16)));
+static float s_fir_delay_l[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
+static float s_fir_delay_r[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
+static float s_l48[FRAMES_PER_READ] __attribute__((aligned(16)));
+static float s_r48[FRAMES_PER_READ] __attribute__((aligned(16)));
+static float s_l16[OUT_PER_READ] __attribute__((aligned(16)));
+static float s_r16[OUT_PER_READ] __attribute__((aligned(16)));
 static int32_t s_raw[FRAMES_PER_READ * 2];
-static int16_t s_pcm16[G722_FRAME_SAMPLES];
+static int16_t s_pcm16_l[G722_FRAME_SAMPLES];
+static int16_t s_pcm16_r[G722_FRAME_SAMPLES];
+
+static int16_t
+to_pcm16(float x)
+{
+    float v = x * 32767.0f;
+    v = v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v);
+    return (int16_t)lrintf(v);
+}
+
+static double
+rms_dbfs(double sum_sq, uint32_t n)
+{
+    double rms = n ? sqrt(sum_sq / n) : 0.0;
+    return rms > 0.0 ? 20.0 * log10(rms) : -INFINITY;
+}
 
 static i2s_chan_handle_t
 i2s_init(void)
@@ -85,17 +110,21 @@ static void
 audio_task(void *arg)
 {
     i2s_chan_handle_t rx = i2s_init();
-    fir_f32_t fir;
-    ESP_ERROR_CHECK(dsps_fird_init_f32(&fir, fir_48k_16k_coeffs, s_fir_delay, FIR_48K_16K_TAPS, DECIM));
-    G722_ENC_CTX *g722 = g722_encoder_new(64000, 0);
+    fir_f32_t fir_l, fir_r;
+    ESP_ERROR_CHECK(dsps_fird_init_f32(&fir_l, fir_48k_16k_coeffs, s_fir_delay_l, FIR_48K_16K_TAPS, DECIM));
+    ESP_ERROR_CHECK(dsps_fird_init_f32(&fir_r, fir_48k_16k_coeffs, s_fir_delay_r, FIR_48K_16K_TAPS, DECIM));
+    G722_ENC_CTX *g722_l = g722_encoder_new(64000, 0);
+    G722_ENC_CTX *g722_r = g722_encoder_new(64000, 0);
     int pcm_count = 0;
+    bool stereo = false;   /* mode de la trame en cours, fige a chaque frontiere */
 
     uint32_t produced = 0, dropped = 0, read_errors = 0;
     UBaseType_t max_depth = 0;
-    double sum_sq = 0.0;
+    double sum_sq_l = 0.0, sum_sq_r = 0.0;
     uint32_t n_sq = 0;
 
-    ESP_LOGI(TAG, "capture demarree (I2S esclave %d Hz -> 16 kHz -> G.722 64 kbit/s)", I2S_SAMPLE_RATE_HZ);
+    ESP_LOGI(TAG, "capture demarree (I2S esclave %d Hz stereo -> 16 kHz -> 2 x G.722 64 kbit/s)",
+             I2S_SAMPLE_RATE_HZ);
 
     while (1) {
         size_t bytes_read = 0;
@@ -106,17 +135,27 @@ audio_task(void *arg)
         }
         size_t frames = bytes_read / (2 * sizeof(int32_t));
         for (size_t i = 0; i < frames; i++) {
-            int32_t left = s_raw[2 * i] >> 8;
-            int32_t right = s_raw[2 * i + 1] >> 8;
-            s_mono48[i] = (float)((left + right) / 2) / 8388608.0f;
+            s_l48[i] = (float)(s_raw[2 * i] >> 8) / 8388608.0f;
+            s_r48[i] = (float)(s_raw[2 * i + 1] >> 8) / 8388608.0f;
         }
-        int nout = dsps_fird_f32(&fir, s_mono48, s_out16, frames / DECIM);
+        int nout = dsps_fird_f32(&fir_l, s_l48, s_l16, frames / DECIM);
+        dsps_fird_f32(&fir_r, s_r48, s_r16, frames / DECIM);
 
         for (int j = 0; j < nout; j++) {
-            float v = s_out16[j] * 32767.0f;
-            v = v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v);
-            s_pcm16[pcm_count++] = (int16_t)lrintf(v);
-            sum_sq += (double)s_out16[j] * s_out16[j];
+            if (pcm_count == 0) {
+                stereo = s_stereo_requested;
+            }
+            float l = s_l16[j], r = s_r16[j];
+            if (stereo) {
+                s_pcm16_l[pcm_count] = to_pcm16(l);
+                s_pcm16_r[pcm_count] = to_pcm16(r);
+            } else {
+                s_pcm16_l[pcm_count] = s_pcm16_r[pcm_count] = to_pcm16(0.5f * (l + r));
+            }
+            pcm_count++;
+            /* Niveaux mesures par voie a l'entree, quel que soit le mode. */
+            sum_sq_l += (double)l * l;
+            sum_sq_r += (double)r * r;
             n_sq++;
             if (pcm_count < G722_FRAME_SAMPLES) {
                 continue;
@@ -124,19 +163,24 @@ audio_task(void *arg)
             pcm_count = 0;
             if (s_restart_requested) {
                 s_restart_requested = false;
-                g722_encoder_destroy(g722);
-                g722 = g722_encoder_new(64000, 0);
+                g722_encoder_destroy(g722_l);
+                g722_encoder_destroy(g722_r);
+                g722_l = g722_encoder_new(64000, 0);
+                g722_r = g722_encoder_new(64000, 0);
                 xQueueReset(s_frames);
             }
-            /* File pleine : on saute ces 20 ms de PCM AVANT l'encodage. Ne
-             * jamais jeter une trame G.722 deja encodee : le codage est
-             * differentiel, le decodeur de l'aide divergerait de l'encodeur. */
+            /* File pleine : on saute ces 20 ms de PCM AVANT l'encodage, pour les
+             * DEUX voies a la fois. Ne jamais jeter une trame G.722 deja encodee :
+             * le codage est differentiel, le decodeur de l'aide divergerait de
+             * l'encodeur ; sauter les deux voies ensemble garde les oreilles en
+             * phase. */
             if (uxQueueSpacesAvailable(s_frames) == 0) {
                 dropped++;
             } else {
-                uint8_t frame[AUDIO_G722_FRAME_BYTES];
-                g722_encode(g722, s_pcm16, G722_FRAME_SAMPLES, frame);
-                xQueueSend(s_frames, frame, 0);
+                struct audio_frame_pair pair;
+                g722_encode(g722_l, s_pcm16_l, G722_FRAME_SAMPLES, pair.left);
+                g722_encode(g722_r, s_pcm16_r, G722_FRAME_SAMPLES, pair.right);
+                xQueueSend(s_frames, &pair, 0);
             }
             produced++;
             UBaseType_t depth = uxQueueMessagesWaiting(s_frames);
@@ -145,13 +189,12 @@ audio_task(void *arg)
             }
 
             if (produced % STATS_PERIOD_FRAMES == 0) {
-                double rms = sqrt(sum_sq / n_sq);
                 ESP_LOGI(TAG, "trames produites %" PRIu32 ", jetees %" PRIu32 ", file max %u/%d,"
-                         " erreurs I2S %" PRIu32 ", niveau %.1f dBFS",
+                         " erreurs I2S %" PRIu32 ", %s, niveau G %.1f dBFS, D %.1f dBFS",
                          produced, dropped, (unsigned)max_depth, QUEUE_DEPTH, read_errors,
-                         rms > 0.0 ? 20.0 * log10(rms) : -INFINITY);
+                         stereo ? "stereo" : "mono", rms_dbfs(sum_sq_l, n_sq), rms_dbfs(sum_sq_r, n_sq));
                 max_depth = 0;
-                sum_sq = 0.0;
+                sum_sq_l = sum_sq_r = 0.0;
                 n_sq = 0;
             }
         }
@@ -161,7 +204,7 @@ audio_task(void *arg)
 esp_err_t
 audio_capture_start(void)
 {
-    s_frames = xQueueCreate(QUEUE_DEPTH, AUDIO_G722_FRAME_BYTES);
+    s_frames = xQueueCreate(QUEUE_DEPTH, sizeof(struct audio_frame_pair));
     if (s_frames == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -182,8 +225,14 @@ audio_capture_restart_stream(void)
     xQueueReset(s_frames);
 }
 
+void
+audio_capture_set_stereo(bool stereo)
+{
+    s_stereo_requested = stereo;
+}
+
 bool
-audio_capture_get_frame(uint8_t out[AUDIO_G722_FRAME_BYTES], TickType_t wait)
+audio_capture_get_frame_pair(struct audio_frame_pair *out, TickType_t wait)
 {
     return xQueueReceive(s_frames, out, wait) == pdTRUE;
 }

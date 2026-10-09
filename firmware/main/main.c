@@ -274,12 +274,16 @@ asha_audio_stream_task(void *arg)
             }
         }
 
-        if (!audio_capture_get_frame(&frame[1], pdMS_TO_TICKS(100))) {
+        struct audio_frame_pair pair;
+        if (!audio_capture_get_frame_pair(&pair, pdMS_TO_TICKS(100))) {
             if (++underruns % 10 == 1) {
                 MODLOG_DFLT(ERROR, "ASHA: pas de trame audio disponible (%d fois)", underruns);
             }
             continue;
         }
+        /* Une seule aide geree pour l'instant : capture en mode mono (defaut),
+         * les deux trames portent le melange G+D. */
+        memcpy(&frame[1], pair.left, ASHA_FRAME_PAYLOAD_LEN);
         frame[0] = g_asha_seq++;
 
         do {
