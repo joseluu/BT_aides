@@ -102,6 +102,20 @@ static const uint8_t g_asha_volume_db = 0x00;
 /* Le compteur de sequence redemarre a 3 a chaque START (sniff HCI Android). */
 #define ASHA_SEQ_FIRST            3
 
+/* Paire ciblee, choisie a la compilation : 1 = paire principale (HiSyncId
+ * 30454345), 2 = paire secondaire (HiSyncId complet 9502464234444331, gauche
+ * capability 0x02, droite 0x03 ; validee en direct le 2026-10-09). Les adresses
+ * de ces aides sont des adresses privees qui tournent en 1-2 min : seul le
+ * HiSyncId identifie la paire. */
+#ifndef ASHA_TARGET_PAIR
+#define ASHA_TARGET_PAIR 1
+#endif
+#if ASHA_TARGET_PAIR == 2
+static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x34, 0x44, 0x43, 0x31};
+#else
+static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x30, 0x45, 0x43, 0x45};
+#endif
+
 /* ==================== Contexte par aide ==================== */
 
 #define ASHA_EAR_UNKNOWN  -1
@@ -161,8 +175,8 @@ static int g_connecting_ear = ASHA_EAR_UNKNOWN;
 /* Un redemarrage du groupe attend les ack de STOP (voir asha_group_update). */
 static bool g_restart_pending;
 static esp_timer_handle_t g_restart_timer;
-/* Mode du scan en cours (passif lent des qu'une aide est en flux). */
-static bool g_scan_passive;
+/* Mode du scan en cours (lent des qu'une aide est en flux). */
+static bool g_scan_slow;
 
 static os_membuf_t sdu_coc_mem[OS_MEMPOOL_SIZE(COC_BUF_COUNT, MTU * 2)];
 static struct os_mempool sdu_coc_mbuf_mempool;
@@ -197,6 +211,16 @@ side_free_slot(void)
         }
     }
     return NULL;
+}
+
+/* Echec pendant la configuration d'une aide : on coupe la connexion GAP, et
+ * BLE_GAP_EVENT_DISCONNECT libere l'emplacement (sinon il resterait en SETUP
+ * et bloquerait le scan pour l'autre cote). */
+static void
+side_fail(struct asha_side *s, const char *why)
+{
+    MODLOG_DFLT(ERROR, "ASHA: %s -> deconnexion de cette aide\n", why);
+    ble_gap_terminate(s->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
 static bool
@@ -401,11 +425,11 @@ asha_maybe_scan(void)
         return;
     }
     if (ble_gap_disc_active()) {
-        bool want_passive = count_in_state(ASHA_STATE_STREAMING) > 0;
-        if (want_passive == g_scan_passive) {
+        bool want_slow = count_in_state(ASHA_STATE_STREAMING) > 0;
+        if (want_slow == g_scan_slow) {
             return;
         }
-        /* Une aide vient d'entrer en flux : repasser en scan passif lent. */
+        /* Une aide vient d'entrer en flux : repasser en scan lent. */
         ble_gap_disc_cancel();
     }
     blecent_scan();
@@ -564,6 +588,7 @@ asha_on_cccd_write(uint16_t conn_handle, const struct ble_gatt_error *error,
     if (error->status != 0) {
         MODLOG_DFLT(ERROR, "ASHA[%s]: activation notifications AudioStatusPoint echouee, status=%d\n",
                     ear_name(s), error->status);
+        side_fail(s, "CCCD AudioStatusPoint");
         UNLOCK();
         return 0;
     }
@@ -595,6 +620,7 @@ asha_on_le_psm_out_read(uint16_t conn_handle, const struct ble_gatt_error *error
     }
     if (error->status != 0 || OS_MBUF_PKTLEN(attr->om) < 2) {
         MODLOG_DFLT(ERROR, "ASHA[%s]: lecture LE_PSM_OUT echouee, status=%d\n", ear_name(s), error->status);
+        side_fail(s, "LE_PSM_OUT");
         UNLOCK();
         return 0;
     }
@@ -627,6 +653,7 @@ asha_on_readonly_props_read(uint16_t conn_handle, const struct ble_gatt_error *e
     if (error->status != 0) {
         MODLOG_DFLT(ERROR, "ASHA[%s]: lecture ReadOnlyProperties echouee, status=%d\n",
                     ear_name(s), error->status);
+        side_fail(s, "ReadOnlyProperties");
         UNLOCK();
         return 0;
     }
@@ -652,12 +679,19 @@ asha_on_readonly_props_read(uint16_t conn_handle, const struct ble_gatt_error *e
         MODLOG_DFLT(INFO, "ASHA[%s] ReadOnlyProperties: version=%d capability=0x%02x "
                     "hisyncid=%016llx codecs=0x%04x\n",
                     ear_name(s), buf[0], buf[1], (unsigned long long)hisyncid, codecs);
-        /* Deux aides du meme cote (ex. connexion par liste blanche au
-         * demarrage) : la seconde est inutile, on la libere. */
+        /* Connexion par liste blanche au demarrage : l'annonce n'a pas ete
+         * filtree, on verifie ici la paire. buf[2..9] est le HiSyncId affiche
+         * ci-dessus ; ses 4 derniers octets (buf[6..9]) sont ceux de l'annonce
+         * (9502464234444331 <-> 34 44 43 31, verifie le 2026-10-09). */
+        if (memcmp(&buf[6], g_asha_expected_truncated_hisyncid, 4) != 0) {
+            side_fail(s, "aide d'une autre paire");
+            UNLOCK();
+            return 0;
+        }
+        /* Deux aides du meme cote : la seconde est inutile, on la libere. */
         for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
             if (&g_sides[i] != s && g_sides[i].state != ASHA_STATE_FREE && g_sides[i].ear == ear) {
-                MODLOG_DFLT(ERROR, "ASHA[%s]: cote deja occupe, deconnexion\n", ear_name(s));
-                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                side_fail(s, "cote deja occupe");
                 UNLOCK();
                 return 0;
             }
@@ -690,7 +724,7 @@ blecent_l2cap_coc_on_disc_complete(const struct peer *peer, int status, void *ar
 #define FIND_CHR(field, uuid, label)                                              \
     chr = peer_chr_find_uuid(peer, &asha_svc_uuid.u, &(uuid).u);                  \
     if (chr == NULL) {                                                            \
-        MODLOG_DFLT(ERROR, "ASHA: characteristic " label " introuvable\n");       \
+        side_fail(s, "characteristic " label " introuvable");                     \
         UNLOCK();                                                                 \
         return;                                                                   \
     }                                                                             \
@@ -706,7 +740,7 @@ blecent_l2cap_coc_on_disc_complete(const struct peer *peer, int status, void *ar
     dsc = peer_dsc_find_uuid(peer, &asha_svc_uuid.u, &asha_audio_status_point_uuid.u,
                              &asha_cccd_uuid.u);
     if (dsc == NULL) {
-        MODLOG_DFLT(ERROR, "ASHA: descripteur CCCD d'AudioStatusPoint introuvable\n");
+        side_fail(s, "descripteur CCCD d'AudioStatusPoint introuvable");
         UNLOCK();
         return;
     }
@@ -727,6 +761,9 @@ blecent_l2cap_coc_event_cb(struct ble_l2cap_event *event, void *arg)
         LOCK();
         if (event->connect.status) {
             MODLOG_DFLT(ERROR, "ASHA[%s]: LE COC error: %d\n", ear_name(s), event->connect.status);
+            if (s->state != ASHA_STATE_FREE) {
+                side_fail(s, "ouverture du canal CoC");
+            }
             UNLOCK();
             return 0;
         }
@@ -752,14 +789,17 @@ blecent_l2cap_coc_event_cb(struct ble_l2cap_event *event, void *arg)
         MODLOG_DFLT(INFO, "ASHA[%s]: canal CoC ferme\n", ear_name(s));
         s->chan = NULL;
         xSemaphoreGive(s->tx_unstalled);
-        if (s->state == ASHA_STATE_REOPENING) {
+        if (s->state != ASHA_STATE_FREE && s->state != ASHA_STATE_SETUP) {
+            /* Fermeture demandee (canal bloque) ou par l'aide : on rouvre le
+             * seul canal CoC, la connexion GAP reste. */
             struct os_mbuf *sdu_rx = os_mbuf_get_pkthdr(&sdu_os_mbuf_pool, 0);
             int rc = ble_l2cap_connect(s->conn_handle, s->psm, MTU, sdu_rx,
                                        blecent_l2cap_coc_event_cb, s);
             MODLOG_DFLT(INFO, "ASHA[%s]: reouverture du canal CoC, rc=%d\n", ear_name(s), rc);
             s->state = ASHA_STATE_SETUP;
-        } else if (s->state != ASHA_STATE_FREE) {
-            s->state = ASHA_STATE_SETUP;
+            if (rc != 0) {
+                side_fail(s, "reouverture du canal CoC");
+            }
         }
         UNLOCK();
         return 0;
@@ -806,40 +846,25 @@ blecent_scan(void)
     disc_params.filter_policy = 0;
     disc_params.limited = 0;
 
+    /* Scan actif (le service data 0xFDF0 est dans l'ADV_IND sur les deux
+     * paires, sniff 01_advertising_scan.pcap et 2026-10-09, mais l'actif
+     * couvre aussi un SCAN_RSP). Une aide en flux : faible taux d'occupation
+     * (30 ms toutes les 500 ms) pour ne pas affamer son lien, deja fragile a
+     * quelques metres. */
+    disc_params.passive = 0;
     if (count_in_state(ASHA_STATE_STREAMING) > 0) {
-        /* Une aide est en flux : scan passif a faible taux d'occupation (30 ms
-         * toutes les 500 ms) pour ne pas affamer son lien, deja fragile a
-         * quelques metres. Le service data 0xFDF0 est dans l'ADV_IND (vu en
-         * event_type=0 sur les deux paires testees), le passif suffit. */
-        disc_params.passive = 1;
         disc_params.itvl = 800;   /* x 0,625 ms = 500 ms */
         disc_params.window = 48;  /* x 0,625 ms = 30 ms */
     } else {
-        disc_params.passive = 0;
         disc_params.itvl = 0;
         disc_params.window = 0;
     }
 
     rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params,
                       blecent_gap_event, NULL);
-    g_scan_passive = disc_params.passive;
-    MODLOG_DFLT(INFO, "ASHA: scan %s lance, rc=%d\n",
-                disc_params.passive ? "passif lent" : "actif", rc);
+    g_scan_slow = disc_params.itvl != 0;
+    MODLOG_DFLT(INFO, "ASHA: scan %s lance, rc=%d\n", g_scan_slow ? "lent" : "continu", rc);
 }
-
-/* Paire ciblee, choisie a la compilation : 1 = paire principale (HiSyncId
- * 30454345), 2 = paire secondaire (HiSyncId complet 9502464234444331, gauche
- * capability 0x02, droite 0x03 ; validee en direct le 2026-10-09). Les adresses
- * de ces aides sont des adresses privees qui tournent en 1-2 min : seul le
- * HiSyncId identifie la paire. */
-#ifndef ASHA_TARGET_PAIR
-#define ASHA_TARGET_PAIR 1
-#endif
-#if ASHA_TARGET_PAIR == 2
-static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x34, 0x44, 0x43, 0x31};
-#else
-static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x30, 0x45, 0x43, 0x45};
-#endif
 
 /* Renvoie le cote annonce (ASHA_EAR_*) si l'annonce vient d'une aide de la
  * paire ciblee dont le cote est encore libre, -2 sinon. */
@@ -999,6 +1024,7 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         if (event->enc_change.status != 0) {
             MODLOG_DFLT(ERROR, "ASHA[%s]: echec du chiffrement/bonding, status=%d\n",
                         ear_name(s), event->enc_change.status);
+            side_fail(s, "chiffrement");
             break;
         }
         MODLOG_DFLT(INFO, "ASHA[%s]: lien chiffre, decouverte du service ASHA\n", ear_name(s));
@@ -1009,6 +1035,7 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
                                    blecent_l2cap_coc_on_disc_complete, NULL);
         if (rc != 0) {
             MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
+            side_fail(s, "decouverte de services");
         }
         break;
 
@@ -1061,9 +1088,15 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         peer_delete(event->disconnect.conn.conn_handle);
         s = side_by_conn(event->disconnect.conn.conn_handle);
         if (s != NULL) {
+            /* Seule une aide deja annoncee a l'autre (prete ou au-dela) change
+             * le groupe ; un echec de configuration ne doit pas couper le son
+             * de l'aide en flux. */
+            bool was_in_group = s->state != ASHA_STATE_SETUP;
             MODLOG_DFLT(INFO, "ASHA[%s]: aide deconnectee\n", ear_name(s));
             side_release(s);
-            asha_on_side_lost();
+            if (was_in_group) {
+                asha_on_side_lost();
+            }
         }
         /* Scan actif (pas la liste blanche) : retrouve l'aide de facon fiable
          * apres un off/on (teste 2026-10-05). */
