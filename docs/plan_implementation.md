@@ -778,6 +778,33 @@ Objectif : vérifier que le firmware n'est pas calé sur la paire principale. Op
 **Critère de sortie** : usage quotidien fonctionnel sans intervention manuelle — allumer la TV
 suffit à démarrer le relai, l'éteindre l'arrête, une coupure BLE ponctuelle se rétablit seule.
 
+### Stéréo sur la paire principale — validée (2026-10-10)
+
+Firmware : commits `69ed8f9` (capture stéréo), `8cef80f` (contexte par côté, orchestration),
+`461765d` (robustesse). Flash effacée avant le flash (bonds repartis de zéro).
+
+- **Architecture retenue** (modèle `asha_pipewire_sink`) : un contexte par côté, aiguillage des
+  notifications par `conn_handle` (les deux aides ont les mêmes handles GATT). Toute arrivée ou
+  départ d'une aide pendant le flux → STOP des côtés actifs, reset des deux encodeurs, seq = 3,
+  `03 01`/`03 00` + START (`otherstate` = 1 si deux aides) sur chaque côté. Une tâche d'envoi
+  permanente pousse la même seq aux deux canaux ; une aide sans crédits bloque la paire (pas de
+  trame jetée d'un seul côté, le décodeur G.722 est différentiel).
+- **Déroulé** : gauche connectée et en flux mono en 6 s ; droite trouvée par le scan lent pendant
+  le flux, prête 4 s après, redémarrage du groupe en ~0,1 s (2 trames jetées en tout), START
+  acquitté des deux côtés. **Stéréo correcte à l'écoute**, liaison stable 13 min à 15 cm,
+  0 trame jetée après le redémarrage, file ≤ 1/6, ~100 attentes de crédits par côté, puce 60 °C.
+- **Piège : téléphone connecté aux aides.** Premier essai refusé par l'aide (`LE COC error: 6`,
+  Insufficient Authorization) alors que l'appairage avait réussi ; Bluetooth du téléphone coupé →
+  succès immédiat. L'aide réserve vraisemblablement son canal audio au téléphone connecté. C'est
+  probablement aussi une explication des `LE COC error: 6` « inexpliqués » de septembre.
+- **Reset après flash** : le reset RTS laisse la carte en mode téléchargement ; utiliser
+  `esptool --after watchdog-reset` (ou bouton RESET).
+- **Non résolu** : deux paniques `Interrupt wdt timeout` (les deux cœurs en idle) à 07:31:46 et
+  07:32:07, pendant le scan, juste après l'échec CoC et le premier bond enregistré ; plus rien
+  ensuite (20 min). Cause inconnue, à surveiller.
+- **Reste à tester** : perte de portée d'un côté puis retour (chemin « départ d'une aide »),
+  portée en stéréo, correctif du crash à la déconnexion.
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).
