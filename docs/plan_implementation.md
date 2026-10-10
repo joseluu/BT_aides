@@ -815,6 +815,28 @@ Firmware : commits `69ed8f9` (capture stéréo), `8cef80f` (contexte par côté,
 - **Reste à tester** : perte de portée d'un côté puis retour (chemin « départ d'une aide »),
   portée en stéréo, correctif du crash à la déconnexion.
 
+### Migration sur XIAO ESP32-S3 + Seeed XIAO Debug Mate (2026-10-11)
+
+But : antenne externe (prise IPEX) pour la portée, console UART0 lisible sans dépendre de
+l'USB-JTAG, alimentation externe 5 V possible.
+
+- **Carte vérifiée** (`esptool flash-id`) : ESP32-S3 QFN56 v0.2, flash 8 MB (quad), PSRAM 8 MB
+  embarquée. Env PlatformIO `xiao_esp32s3` (preset `seeed_xiao_esp32s3`) ; `sdkconfig` généré
+  identique à `esp32s3_com12` hormis la taille flash. Flash effacée avant le premier flash.
+- **Câblage, mêmes GPIO que la Supermini → aucun changement de code** : BCK = D4 (GPIO5),
+  LRCK = D5 (GPIO6), DATA = D8 (GPIO7), MCLK non connecté, PCM1808 en 3V3/GND, console UART0
+  TX = D6 (GPIO43).
+- **Debug Mate** : réglage série **XIAO** (écoute D6/D7 de la XIAO enfichée, sans fil) en mode
+  **Passthrough**, 115200 bauds ; il apparaît côté PC comme port série DAPLink (VID 0D28). Le
+  mode GROVE sert à un appareil UART externe sur le connecteur Grove. Attention à ne pas mettre
+  en parallèle l'alimentation externe 5 V, le 5 V du Debug Mate et le VBUS USB de la XIAO.
+- **Acquisition validée sans les aides** (log `audio:` toutes les 10 s, source PC) : 50 trames/s,
+  0 erreur I2S, 0 trame jetée ; entrée débranchée −53 dBFS (entrée flottante), source branchée
+  volume 0 **−65 dBFS** (−54 dBFS sur la Supermini dans les mêmes conditions), musique volume 30
+  **−42 dBFS** sur les deux voies.
+- **Reste à faire** : test d'un canal seul (inversion G/D), ré-appairage et essai avec les aides
+  (nouvelle puce, bonds à refaire), portée avec l'antenne externe.
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).
