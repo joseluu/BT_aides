@@ -802,6 +802,16 @@ Firmware : commits `69ed8f9` (capture stéréo), `8cef80f` (contexte par côté,
 - **Non résolu** : deux paniques `Interrupt wdt timeout` (les deux cœurs en idle) à 07:31:46 et
   07:32:07, pendant le scan, juste après l'échec CoC et le premier bond enregistré ; plus rien
   ensuite (20 min). Cause inconnue, à surveiller.
+- **Essai +20 dBm (même matinée), abandonné** : la distance de décrochage n'augmente pas par
+  rapport à +9 dBm (le lien est vraisemblablement limité dans le sens aide → ESP32). Derrière un
+  isolateur USB, +20 dBm provoque des redémarrages juste après START et un fort ronflement
+  (alimentation insuffisante pour les pointes d'émission). Retour à +9 dBm.
+- **Droite éloignée → plus de son à gauche** (en stéréo) ; retour par off-on des deux aides. Cause
+  non établie : la console USB-JTAG s'est figée 14 s après le START (sans panique ni redémarrage),
+  rien n'a été enregistré. Hypothèse à vérifier : lien droit à moitié vivant, boucle
+  blocage 1 s → réouverture CoC → redémarrage du groupe (STOP à gauche). Prochain essai avec la
+  console UART0 (GPIO43) via un adaptateur USB-série derrière l'isolateur, ESP32 sur alimentation
+  externe.
 - **Reste à tester** : perte de portée d'un côté puis retour (chemin « départ d'une aide »),
   portée en stéréo, correctif du crash à la déconnexion.
 
