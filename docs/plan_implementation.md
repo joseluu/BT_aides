@@ -909,6 +909,36 @@ n'émet plus de son alors que l'ESP32 reste connecté, envoie le flux et reçoit
 - Reste à confirmer : un essai long (ESP32 + deux aides, 2,5–3 m, ~15 min) sans aucun
   appareil concurrent, pour vérifier que les coupures 531 et les silences ont disparu.
 
+### Aides muettes après un creux radio : relance automatique du groupe (2026-10-11, soir)
+
+Essais avec l'iPhone éteint et le sniffer en surveillance (aucun appareil étranger, hormis des
+paquets isolés corrompus).
+
+- **Antenne d'origine, 2,5–3 m, firmware sans relance** : une perte audible toutes les 1 à 2 min.
+  Chaque perte correspond à un creux radio sur une aide (−90 à −114 dBm, même immobile : passages,
+  réflexions). Souvent **les deux aides deviennent muettes**, et y restent, alors que les liaisons
+  sont revenues, que les trames leur parviennent et qu'elles rendent leurs crédits ; aucune
+  notification d'état. Le côté qu'on entend couper n'est pas forcément celui dont le lien a faibli
+  (synchronisation stéréo entre les aides, hypothèse). Au bout de 40 s à 4 min, une aide finit par
+  **couper elle-même la liaison (531)** avec un bon RSSI : c'est l'autre cause des 531.
+- **Codes de déconnexion** : extinction d'une aide par son bouton → 520 (perte de liaison, 3 s) ;
+  531 = l'aide a décidé de couper.
+- **Vérification** : la coupure 531 de la gauche a provoqué un redémarrage du groupe en mono, et
+  la droite, muette jusque-là, a retrouvé le son → un STOP/START débloque une aide muette.
+- **Correctif** (commits `74252ca`, `c99f2d7`) : `asha_group_resync()` (STOP puis START des aides
+  en flux) ; relance automatique quand une liaison est passée sous −92 dBm puis que toutes sont
+  revenues au-dessus de −85 dBm (RSSI relevé toutes les 5 s), au plus une fois toutes les 10 s ;
+  relance manuelle par le bouton BOOT (GPIO0). Validé : à 4 m puis 5 m le son se coupe, et la
+  stéréo revient seule en se rapprochant, sans extinction des aides ni coupure 531.
+- **Autre bug corrigé** (`74252ca`) : une connexion qui tombe avant `BLE_GAP_EVENT_CONNECT`
+  (reason 519, avec `BLE_ERR_UNK_CONN_ID` sur la lecture de version) laissait `g_connecting` à vrai
+  → scan jamais relancé, la seconde aide ne revenait pas.
+- **Antenne RP-TNC de 10 cm** (routeur Wi-Fi, via adaptateur) : RSSI comparable mais ~550
+  attentes de crédits en 1 min 30 près de la carte (0 avec l'antenne d'origine) et coupures même
+  de près → connecteur ou adaptateur suspect, à passer au SNA D6 (`diagnostic_antenne.md`).
+- **Pistes** : relever le RSSI plus souvent (1–2 s) pour relancer plus tôt ; déclencher aussi sur
+  une rafale d'attentes de crédits ; essai long en usage réel (TV, 2–3 m, 30 min).
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).
