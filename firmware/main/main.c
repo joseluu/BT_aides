@@ -1419,7 +1419,7 @@ app_main(void)
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);
-    xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 2, NULL);
+    xTaskCreate(boot_button_task, "boot_btn", 4096, NULL, 2, NULL);
     xTaskCreate(asha_audio_stream_task, "asha_audio", 4096, NULL, 10, NULL);
 
     ret = nimble_port_init();
