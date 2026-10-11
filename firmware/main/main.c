@@ -239,7 +239,19 @@ side_free_slot(void)
 #endif
 #define ASHA_RESYNC_DIP_DBM     (-92)
 #define ASHA_RESYNC_OK_DBM      (-85)
+/* Espacement minimal entre deux relances automatiques, double a chaque
+ * relance rapprochee jusqu'au maximum, remis au minimum apres
+ * ASHA_RESYNC_CALM_US sans relance. */
 #define ASHA_RESYNC_MIN_GAP_US  (10 * 1000 * 1000LL)
+#define ASHA_RESYNC_MAX_GAP_US  (60 * 1000 * 1000LL)
+#define ASHA_RESYNC_CALM_US     (120 * 1000 * 1000LL)
+/* Nombre de mesures RSSI consecutives (une par seconde) au-dessus de
+ * ASHA_RESYNC_OK_DBM avant de relancer. */
+#define ASHA_RESYNC_GOOD_SAMPLES 3
+#define ASHA_RESYNC_FADE_MS          200
+/* File de trames (6 x 20 ms) + envoi : les trames du fondu doivent etre
+ * parties avant le STOP. */
+#define ASHA_RESYNC_QUEUE_MARGIN_MS  150
 
 #if ASHA_LOG_BOND_KEYS
 static void
@@ -486,15 +498,15 @@ asha_on_side_lost(void)
  * une aide peut rester muette alors que la liaison est revenue, que les
  * trames lui parviennent et qu'elle rend ses credits ; elle finit par couper
  * la liaison (531) quelques minutes plus tard. */
+static esp_timer_handle_t g_resync_timer;
+static bool g_resync_fading;
+
 static void
-asha_group_resync(const char *why)
+asha_resync_stop_now(void)
 {
-    LOCK();
     if (g_restart_pending || count_in_state(ASHA_STATE_STREAMING) == 0) {
-        UNLOCK();
         return;
     }
-    MODLOG_DFLT(WARN, "ASHA: relance du groupe (%s)\n", why);
     g_restart_pending = true;
     for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
         struct asha_side *s = &g_sides[i];
@@ -504,6 +516,38 @@ asha_group_resync(const char *why)
         }
     }
     esp_timer_start_once(g_restart_timer, 1000 * 1000);
+}
+
+/* Fin du fondu sortant : les trames silencieuses sont parties, STOP. */
+static void
+asha_resync_timeout(void *arg)
+{
+    LOCK();
+    g_resync_fading = false;
+    asha_resync_stop_now();
+    UNLOCK();
+}
+
+/* Relance le groupe (STOP puis START sur toutes les aides en flux) sans
+ * changement de composition. Observe le 2026-10-11 : apres un creux radio,
+ * une aide peut rester muette alors que la liaison est revenue, que les
+ * trames lui parviennent et qu'elle rend ses credits ; elle finit par couper
+ * la liaison (531) quelques minutes plus tard. L'aide coupe net au STOP mais
+ * remonte le son en douceur au START : on abaisse d'abord le niveau
+ * (fondu de ASHA_RESYNC_FADE_MS), puis STOP une fois ces trames envoyees. */
+static void
+asha_group_resync(const char *why)
+{
+    LOCK();
+    if (g_restart_pending || g_resync_fading || count_in_state(ASHA_STATE_STREAMING) == 0) {
+        UNLOCK();
+        return;
+    }
+    MODLOG_DFLT(WARN, "ASHA: relance du groupe (%s)\n", why);
+    g_resync_fading = true;
+    audio_capture_fade_out(ASHA_RESYNC_FADE_MS);
+    esp_timer_start_once(g_resync_timer,
+                         (ASHA_RESYNC_FADE_MS + ASHA_RESYNC_QUEUE_MARGIN_MS) * 1000);
     UNLOCK();
 }
 
@@ -1342,53 +1386,83 @@ temp_log_task(void *arg)
     temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
     ESP_ERROR_CHECK(temperature_sensor_install(&cfg, &tsens));
     ESP_ERROR_CHECK(temperature_sensor_enable(tsens));
-    while (1) {
+    /* Relance automatique : creux vu sur une liaison, puis toutes les liaisons
+     * au-dessus de ASHA_RESYNC_OK_DBM pendant ASHA_RESYNC_GOOD_SAMPLES s. */
+    bool dip_seen = false;
+    int good_run = 0;
+    int64_t last_resync_us = 0;
+    int64_t gap_us = ASHA_RESYNC_MIN_GAP_US;
+    for (unsigned tick = 0;; tick++) {
+        bool log_now = tick % 5 == 0;
         float c = 0.0f;
-        if (temperature_sensor_get_celsius(tsens, &c) == ESP_OK) {
+        if (log_now && temperature_sensor_get_celsius(tsens, &c) == ESP_OK) {
             ESP_LOGI("temp", "temperature puce %.1f C", c);
         }
         /* RSSI du lien de chaque aide connectee (mesure du controleur sur les
-         * paquets recus de l'aide) : sert aux essais de portee. */
+         * paquets recus de l'aide), releve chaque seconde, affiche toutes les
+         * 5 s : sert aux essais de portee et a la relance automatique. */
         uint16_t conns[ASHA_SLOT_COUNT];
         int ears[ASHA_SLOT_COUNT];
+        bool streaming[ASHA_SLOT_COUNT];
         int n = 0;
+        int n_streaming = 0;
         LOCK();
         for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
             if (g_sides[i].state != ASHA_STATE_FREE) {
                 conns[n] = g_sides[i].conn_handle;
-                ears[n++] = g_sides[i].ear;
+                ears[n] = g_sides[i].ear;
+                streaming[n] = g_sides[i].state == ASHA_STATE_STREAMING;
+                n_streaming += streaming[n];
+                n++;
             }
         }
         UNLOCK();
         bool dip = false;
-        bool all_good = true;
+        bool all_good = n_streaming > 0;
         for (int i = 0; i < n; i++) {
             int8_t rssi;
-            if (ble_gap_conn_rssi(conns[i], &rssi) == 0) {
+            if (ble_gap_conn_rssi(conns[i], &rssi) != 0) {
+                all_good &= !streaming[i];
+                continue;
+            }
+            if (log_now) {
                 ESP_LOGI("rssi", "aide %s : %d dBm",
                          ears[i] == ASHA_EAR_LEFT ? "G" : (ears[i] == ASHA_EAR_RIGHT ? "D" : "?"),
                          rssi);
-                dip |= rssi <= ASHA_RESYNC_DIP_DBM;
-                all_good &= rssi >= ASHA_RESYNC_OK_DBM;
             }
+            /* Seules les aides en flux comptent ; -127 = pas encore de mesure
+             * (liaison toute neuve : fausse relance observee au demarrage). */
+            if (!streaming[i] || rssi <= -120) {
+                continue;
+            }
+            dip |= rssi <= ASHA_RESYNC_DIP_DBM;
+            all_good &= rssi >= ASHA_RESYNC_OK_DBM;
         }
 #if ASHA_AUTO_RESYNC
-        /* Creux sur une liaison, puis retour des deux a un niveau correct :
-         * relance du groupe, au plus une fois par ASHA_RESYNC_MIN_GAP_US. */
-        static bool s_dip_seen;
-        static int64_t s_last_resync_us;
-        s_dip_seen |= dip;
-        if (s_dip_seen && all_good && n > 0 &&
-            esp_timer_get_time() - s_last_resync_us >= ASHA_RESYNC_MIN_GAP_US) {
-            s_dip_seen = false;
-            s_last_resync_us = esp_timer_get_time();
+        int64_t now = esp_timer_get_time();
+        if (now - last_resync_us >= ASHA_RESYNC_CALM_US) {
+            gap_us = ASHA_RESYNC_MIN_GAP_US;
+        }
+        dip_seen |= dip;
+        good_run = all_good ? good_run + 1 : 0;
+        if (dip_seen && good_run >= ASHA_RESYNC_GOOD_SAMPLES && now - last_resync_us >= gap_us) {
+            /* Relance rapprochee de la precedente : on espacera davantage la
+             * suivante (une aide en limite de portee relancerait sans cesse). */
+            if (last_resync_us != 0 && now - last_resync_us < ASHA_RESYNC_CALM_US) {
+                gap_us = gap_us * 2 > ASHA_RESYNC_MAX_GAP_US ? ASHA_RESYNC_MAX_GAP_US : gap_us * 2;
+            }
+            dip_seen = false;
+            last_resync_us = now;
             asha_group_resync("apres un creux radio");
         }
 #else
         (void)dip;
-        (void)all_good;
+        (void)dip_seen;
+        (void)good_run;
+        (void)last_resync_us;
+        (void)gap_us;
 #endif
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -1438,6 +1512,11 @@ app_main(void)
         .name = "asha_restart",
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &g_restart_timer));
+    const esp_timer_create_args_t resync_args = {
+        .callback = asha_resync_timeout,
+        .name = "asha_resync",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&resync_args, &g_resync_timer));
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);

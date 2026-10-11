@@ -51,6 +51,8 @@ static const char *TAG = "audio";
 static QueueHandle_t s_frames;
 static volatile bool s_restart_requested;
 static volatile bool s_stereo_requested;
+/* Fondu sortant demande (duree en echantillons a 16 kHz), 0 = aucun. */
+static volatile uint32_t s_fade_request_samples;
 
 /* Tableaux alignes sur 16 octets : exigence de la version ESP32-S3 de
  * dsps_fird_f32. Statiques : pas sur la pile de la tache. */
@@ -116,6 +118,8 @@ audio_task(void *arg)
     G722_ENC_CTX *g722_l = g722_encoder_new(64000, 0);
     G722_ENC_CTX *g722_r = g722_encoder_new(64000, 0);
     int pcm_count = 0;
+    float gain = 1.0f;      /* gain du fondu sortant, remis a 1 au redemarrage du flux */
+    float gain_step = 0.0f;
     bool stereo = false;   /* mode de la trame en cours, fige a chaque frontiere */
 
     uint32_t produced = 0, dropped = 0, read_errors = 0;
@@ -146,6 +150,21 @@ audio_task(void *arg)
                 stereo = s_stereo_requested;
             }
             float l = s_l16[j], r = s_r16[j];
+            /* Niveaux mesures par voie a l'entree, quel que soit le mode. */
+            sum_sq_l += (double)l * l;
+            sum_sq_r += (double)r * r;
+            n_sq++;
+            if (s_fade_request_samples != 0) {
+                gain_step = gain / (float)s_fade_request_samples;
+                s_fade_request_samples = 0;
+            }
+            if (gain < 1.0f) {
+                l *= gain;
+                r *= gain;
+            }
+            if (gain_step > 0.0f) {
+                gain = gain > gain_step ? gain - gain_step : 0.0f;
+            }
             if (stereo) {
                 s_pcm16_l[pcm_count] = to_pcm16(l);
                 s_pcm16_r[pcm_count] = to_pcm16(r);
@@ -153,10 +172,6 @@ audio_task(void *arg)
                 s_pcm16_l[pcm_count] = s_pcm16_r[pcm_count] = to_pcm16(0.5f * (l + r));
             }
             pcm_count++;
-            /* Niveaux mesures par voie a l'entree, quel que soit le mode. */
-            sum_sq_l += (double)l * l;
-            sum_sq_r += (double)r * r;
-            n_sq++;
             if (pcm_count < G722_FRAME_SAMPLES) {
                 continue;
             }
@@ -168,6 +183,8 @@ audio_task(void *arg)
                 g722_l = g722_encoder_new(64000, 0);
                 g722_r = g722_encoder_new(64000, 0);
                 xQueueReset(s_frames);
+                gain = 1.0f;
+                gain_step = 0.0f;
             }
             /* File pleine : on saute ces 20 ms de PCM AVANT l'encodage, pour les
              * DEUX voies a la fois. Ne jamais jeter une trame G.722 deja encodee :
@@ -223,6 +240,13 @@ audio_capture_restart_stream(void)
      * prendre une trame encodee avec l'ancien etat avant que le producteur
      * n'ait traite la demande (au plus une trame peut encore passer). */
     xQueueReset(s_frames);
+}
+
+void
+audio_capture_fade_out(uint32_t ms)
+{
+    uint32_t n = ms * (I2S_SAMPLE_RATE_HZ / DECIM / 1000);
+    s_fade_request_samples = n > 0 ? n : 1;
 }
 
 void
