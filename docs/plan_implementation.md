@@ -866,8 +866,48 @@ l'USB-JTAG, alimentation externe 5 V possible.
 - **Antenne de point d'accès récupérée (connecteur IPEX direct)** : aide vue à −91 dBm à courte
   distance, connexion perdue 1,4 s après l'établissement (reason 519) ; retour à l'antenne
   d'origine → reconnexion normale. Antenne à diagnostiquer.
-- **Reste à faire** : test d'un canal seul (inversion G/D), vérification du passage en mono à
-  la perte d'une aide.
+- **Passage en mono validé en réel** : l'aide droite tombée pendant un essai de portée → STATUS
+  et redémarrage du groupe en mono immédiats (indicateur `in_group`).
+- **Reste à faire** : test d'un canal seul (inversion G/D).
+
+### Coupures 531 et silences : un iPhone appairé aux aides (2026-10-11, après-midi)
+
+Symptômes : aide qui coupe d'elle-même (`reason=531`) avec un bon RSSI, et périodes où l'aide
+n'émet plus de son alors que l'ESP32 reste connecté, envoie le flux et reçoit des crédits.
+
+**Méthode (réutilisable)** :
+- Bonds NimBLE en RAM seulement (`NVS_PERSIST` désactivé) : rien à lire en flash. Option de
+  compilation `ASHA_LOG_BOND_KEYS` (défaut 0, ex. `PLATFORMIO_BUILD_FLAGS="-DASHA_LOG_BOND_KEYS=1"`)
+  : affiche l'identité, l'IRK et la LTK de chaque aide au chiffrement, et demande la distribution
+  de l'identité (sans elle, pas d'IRK). Les clés valent jusqu'au prochain reset de l'ESP32.
+- Sniffer : `nrfutil ble-sniffer sniff --port COMxx --irk-key 0x<IRK> --sc-ltk-key 0x<LTK>
+  --output-pcap-file x.pcap` (clés en big-endian). Le sniffer s'accroche aux annonces de l'aide
+  (adresses privées résolues) mais rate souvent le CONNECT_IND de l'ESP32. L'horloge des paquets
+  du sniffer était décalée de +71 min 35 s ce jour-là.
+- Résolution d'une adresse privée avec une IRK : `ah(irk, prand) = AES-128(irk, 0^13 || prand)`,
+  3 derniers octets, clé en big-endian.
+- Dans les paquets en clair au début d'une connexion, `LL_VERSION_IND` donne le fabricant de la
+  puce et la version Bluetooth de chaque côté : c'est ce qui a désigné le coupable.
+
+**Constats** :
+- L'aide gauche **continue d'émettre ses annonces pendant qu'elle est connectée** à l'ESP32.
+- Un autre central sollicitait l'aide gauche par rafales (jusqu'à une demande de connexion toutes
+  les ~6 s) : connexion à 30 ms, `LL_VERSION_IND`, recherche de service, `LL_ENC_REQ` avec sa
+  propre clé (déchiffrement « bad MIC » avec la nôtre), puis nouvelle tentative ; cinq adresses
+  privées successives. Les rafales coïncidaient avec les coupures et les silences.
+- Éliminés un par un (coupure du Bluetooth ou extinction, et par le RSSI) : les deux PC Windows,
+  téléphones et tablette de la maison, télévision, aide droite, XIAO et Debug Mate.
+- `LL_VERSION_IND` du central : **Broadcom, Bluetooth 5.3** (l'aide : Sivantos, 5.1) → piste Apple.
+  Un **iPhone SE oublié en charge** après une décharge profonde s'était rallumé seul ; au
+  déverrouillage (code demandé), les demandes ont cessé (16:09:38) et l'iPhone a affiché
+  « connecté aux aides ». Hypothèse : avant le premier déverrouillage après un redémarrage, iOS
+  n'a pas accès aux clés d'appairage et retente la connexion en boucle. iPhone éteint (appairage
+  conservé à la demande de l'utilisateur).
+- **À retenir** : tout appareil appairé aux aides (iPhone en MFi, application du fabricant sur un
+  autre téléphone…) entre en concurrence avec l'ESP32, au point de couper le flux. S'il se
+  rallume (en charge, par exemple), le problème reviendra.
+- Reste à confirmer : un essai long (ESP32 + deux aides, 2,5–3 m, ~15 min) sans aucun
+  appareil concurrent, pour vérifier que les coupures 531 et les silences ont disparu.
 
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 

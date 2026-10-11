@@ -222,6 +222,55 @@ side_free_slot(void)
 /* Echec pendant la configuration d'une aide : on coupe la connexion GAP, et
  * BLE_GAP_EVENT_DISCONNECT libere l'emplacement (sinon il resterait en SETUP
  * et bloquerait le scan pour l'autre cote). */
+/* Diagnostic au sniffer nRF (--irk-key / --sc-ltk-key) : affiche l'IRK et la
+ * LTK de l'aide apres le chiffrement. Les bonds ne sont qu'en RAM
+ * (NVS_PERSIST desactive) : la LTK reste valable jusqu'au prochain reset de
+ * l'ESP32, reconnexions comprises. A ne jamais activer hors diagnostic. */
+#ifndef ASHA_LOG_BOND_KEYS
+#define ASHA_LOG_BOND_KEYS 0
+#endif
+
+#if ASHA_LOG_BOND_KEYS
+static void
+log_key_be(const char *name, const char *ear, const uint8_t *k)
+{
+    char hex[2 * 16 + 1];
+    /* NimBLE stocke les cles en little-endian ; nrfutil les attend en
+     * big-endian, prefixees par 0x. */
+    for (int i = 0; i < 16; i++) {
+        sprintf(&hex[2 * i], "%02x", k[15 - i]);
+    }
+    MODLOG_DFLT(WARN, "ASHA[%s]: CLE %s 0x%s\n", ear, name, hex);
+}
+
+static void
+log_bond_keys(const struct asha_side *s)
+{
+    struct ble_gap_conn_desc desc;
+    struct ble_store_key_sec key = {0};
+    struct ble_store_value_sec val;
+
+    if (ble_gap_conn_find(s->conn_handle, &desc) != 0) {
+        return;
+    }
+    key.peer_addr = desc.peer_id_addr;
+    if (ble_store_read_peer_sec(&key, &val) != 0) {
+        MODLOG_DFLT(WARN, "ASHA[%s]: cles du bond introuvables\n", ear_name(s));
+        return;
+    }
+    MODLOG_DFLT(WARN, "ASHA[%s]: identite %02x:%02x:%02x:%02x:%02x:%02x (type %d), sc=%d\n",
+                ear_name(s), val.peer_addr.val[5], val.peer_addr.val[4], val.peer_addr.val[3],
+                val.peer_addr.val[2], val.peer_addr.val[1], val.peer_addr.val[0],
+                val.peer_addr.type, val.sc);
+    if (val.irk_present) {
+        log_key_be("IRK", ear_name(s), val.irk);
+    }
+    if (val.ltk_present) {
+        log_key_be("LTK", ear_name(s), val.ltk);
+    }
+}
+#endif
+
 static void
 side_fail(struct asha_side *s, const char *why)
 {
@@ -1071,6 +1120,9 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
             break;
         }
         MODLOG_DFLT(INFO, "ASHA[%s]: lien chiffre, decouverte du service ASHA\n", ear_name(s));
+#if ASHA_LOG_BOND_KEYS
+        log_bond_keys(s);
+#endif
         /* Decouverte CIBLEE sur le seul service ASHA : une decouverte complete
          * (services proprietaires en plus) prend 30-40 s et l'aide refuse
          * ensuite l'ouverture du CoC (LE COC error 6). */
@@ -1302,6 +1354,12 @@ app_main(void)
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_our_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC;
+#if ASHA_LOG_BOND_KEYS
+    /* IRK de l'aide, pour que le sniffer resolve ses adresses privees
+     * tournantes (Android demande aussi la distribution de l'identite). */
+    ble_hs_cfg.sm_our_key_dist |= BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ID;
+#endif
     ble_hs_cfg.sm_sc = 1;
 
     blecent_l2cap_coc_mem_init();
