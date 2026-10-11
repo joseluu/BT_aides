@@ -231,11 +231,11 @@ side_free_slot(void)
 #define ASHA_LOG_BOND_KEYS 0
 #endif
 
-/* Relance automatique du groupe apres un creux radio (voir asha_group_resync).
- * Desactivee tant que la relance manuelle (bouton BOOT) n'a pas montre qu'un
- * STOP/START debloque une aide muette. */
+/* Relance automatique du groupe apres un creux radio (voir asha_group_resync) :
+ * un STOP/START rend le son a une aide restee muette apres un creux (verifie
+ * en reel le 2026-10-11). */
 #ifndef ASHA_AUTO_RESYNC
-#define ASHA_AUTO_RESYNC 0
+#define ASHA_AUTO_RESYNC 1
 #endif
 #define ASHA_RESYNC_DIP_DBM     (-92)
 #define ASHA_RESYNC_OK_DBM      (-85)
