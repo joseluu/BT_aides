@@ -938,6 +938,33 @@ paquets isolés corrompus).
   de près → connecteur ou adaptateur suspect, à passer au SNA D6 (`diagnostic_antenne.md`).
 - **Pistes** : relever le RSSI plus souvent (1–2 s) pour relancer plus tôt ; déclencher aussi sur
   une rafale d'attentes de crédits ; essai long en usage réel (TV, 2–3 m, 30 min).
+- **Coût d'une relance** (bouton BOOT, près de la carte) : ~0,5 s de son perdu ; l'aide remonte le
+  son en douceur (~0,5 s) mais coupe net au STOP. Piste : fondu sortant de ~200 ms appliqué au PCM
+  avant le STOP. Bug corrigé (`027606d`) : pile de 2 Ko trop petite pour la tâche du bouton
+  (redémarrage de l'ESP32 à l'appui).
+
+### Reconnexion sans off/on après un redémarrage de l'ESP32 (2026-10-11, soir)
+
+Jusqu'ici, tout redémarrage de l'ESP32 (flash, coupure de l'USB, mise en veille du PC) imposait
+d'éteindre et rallumer les aides : les bonds n'étaient qu'en RAM, il fallait refaire un appairage,
+que les aides n'acceptent que peu après leur mise en marche.
+
+Correctif (commit `2b26372`) :
+- `CONFIG_BT_NIMBLE_NVS_PERSIST=y` : bonds enregistrés en flash ;
+- distribution de l'identité (IRK) toujours demandée : le contrôleur résout les adresses privées
+  tournantes des aides vers leur adresse d'identité (publique, `20:3a:ef:…`) ;
+- au démarrage, la liste blanche existante (`ble_gap_wl_set` + connexion, 10 s) prend la première
+  aide connue ; la seconde est trouvée par le scan, qui reconnaît maintenant une aide **déjà
+  appairée** par son adresse d'identité, même sans données ASHA dans l'annonce. Le contrôleur
+  signale l'adresse résolue avec le type `PUBLIC_ID` (2) : ramené à `PUBLIC` (0) pour retrouver le
+  bond.
+
+Vérifié : après un reset de l'ESP32, aides non touchées, droite connectée et chiffrée en 1,1 s,
+stéréo en 5 s. Une aide déjà appairée s'annonce sous son adresse d'identité, et l'aide gauche
+continue d'émettre ses annonces pendant qu'elle est connectée.
+
+À retenir : `MAX_BONDS=3` (le plus récent évince le plus ancien) ; pour changer de paire d'aides
+(`ASHA_TARGET_PAIR`), effacer la flash (`pio run -e xiao_esp32s3 -t erase`) puis appairer.
 
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
