@@ -153,9 +153,15 @@ struct asha_side {
     bool stalled;
     int consecutive_failures;
     unsigned stall_count;
+    bool reopen_pending;           /* reouverture CoC programmee (g_reopen_co) */
+    bool in_group;                 /* deja annoncee prete au groupe (reste vrai
+                                    * pendant une reouverture du CoC) */
 };
 
 static struct asha_side g_sides[ASHA_SLOT_COUNT];
+/* Reouverture differee du canal CoC, une par emplacement (hors de asha_side :
+ * side_release l'efface avec memset). */
+static struct ble_npl_callout g_reopen_co[ASHA_SLOT_COUNT];
 
 /* Protege g_sides, g_seq et les decisions d'orchestration, partages entre la
  * tache hote NimBLE (callbacks), la tache d'envoi audio et le minuteur de
@@ -599,6 +605,7 @@ asha_on_cccd_write(uint16_t conn_handle, const struct ble_gatt_error *error,
                                          &g_asha_volume_db, sizeof(g_asha_volume_db));
     MODLOG_DFLT(INFO, "ASHA[%s]: notifications actives, Volume rc=%d, aide prete\n", ear_name(s), rc);
     s->state = ASHA_STATE_READY;
+    s->in_group = true;
     asha_group_update();
     asha_maybe_scan();
     UNLOCK();
@@ -632,7 +639,16 @@ asha_on_le_psm_out_read(uint16_t conn_handle, const struct ble_gatt_error *error
      * BLE_L2CAP_EVENT_COC_CONNECTED. */
     MODLOG_DFLT(INFO, "ASHA[%s]: PSM 0x%04x, ouverture du canal L2CAP CoC...\n", ear_name(s), s->psm);
     sdu_rx = os_mbuf_get_pkthdr(&sdu_os_mbuf_pool, 0);
-    ble_l2cap_connect(conn_handle, s->psm, MTU, sdu_rx, blecent_l2cap_coc_event_cb, s);
+    int rc = sdu_rx == NULL ? BLE_HS_ENOMEM
+                            : ble_l2cap_connect(conn_handle, s->psm, MTU, sdu_rx,
+                                                blecent_l2cap_coc_event_cb, s);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "ASHA[%s]: ouverture du canal CoC, rc=%d\n", ear_name(s), rc);
+        if (sdu_rx != NULL) {
+            os_mbuf_free_chain(sdu_rx);
+        }
+        side_fail(s, "ouverture du canal CoC");
+    }
     UNLOCK();
     return 0;
 }
@@ -791,15 +807,16 @@ blecent_l2cap_coc_event_cb(struct ble_l2cap_event *event, void *arg)
         xSemaphoreGive(s->tx_unstalled);
         if (s->state != ASHA_STATE_FREE && s->state != ASHA_STATE_SETUP) {
             /* Fermeture demandee (canal bloque) ou par l'aide : on rouvre le
-             * seul canal CoC, la connexion GAP reste. */
-            struct os_mbuf *sdu_rx = os_mbuf_get_pkthdr(&sdu_os_mbuf_pool, 0);
-            int rc = ble_l2cap_connect(s->conn_handle, s->psm, MTU, sdu_rx,
-                                       blecent_l2cap_coc_event_cb, s);
-            MODLOG_DFLT(INFO, "ASHA[%s]: reouverture du canal CoC, rc=%d\n", ear_name(s), rc);
+             * seul canal CoC, la connexion GAP reste. Jamais depuis ce
+             * callback : NimBLE n'a pas encore libere l'ancien canal (pool
+             * plein en stereo -> rc=6), et si la connexion GAP est en train
+             * de tomber, BLE_GAP_EVENT_DISCONNECT n'est pas encore passe.
+             * Reouvrir ici donnait des appels recursifs puis un LoadProhibited
+             * dans ble_hs_conn_delete_chan (2026-10-11). Le callout s'execute
+             * dans la tache hote apres la fin de ce traitement. */
             s->state = ASHA_STATE_SETUP;
-            if (rc != 0) {
-                side_fail(s, "reouverture du canal CoC");
-            }
+            s->reopen_pending = true;
+            ble_npl_callout_reset(&g_reopen_co[s - g_sides], 0);
         }
         UNLOCK();
         return 0;
@@ -811,6 +828,32 @@ blecent_l2cap_coc_event_cb(struct ble_l2cap_event *event, void *arg)
     default:
         return 0;
     }
+}
+
+static void
+asha_reopen_cb(struct ble_npl_event *ev)
+{
+    struct asha_side *s = ble_npl_event_get_arg(ev);
+
+    LOCK();
+    /* Emplacement libere (deconnexion GAP) ou reutilise entre-temps. */
+    if (!s->reopen_pending || s->state != ASHA_STATE_SETUP || s->chan != NULL) {
+        UNLOCK();
+        return;
+    }
+    s->reopen_pending = false;
+    struct os_mbuf *sdu_rx = os_mbuf_get_pkthdr(&sdu_os_mbuf_pool, 0);
+    int rc = sdu_rx == NULL ? BLE_HS_ENOMEM
+                            : ble_l2cap_connect(s->conn_handle, s->psm, MTU, sdu_rx,
+                                                blecent_l2cap_coc_event_cb, s);
+    MODLOG_DFLT(INFO, "ASHA[%s]: reouverture du canal CoC, rc=%d\n", ear_name(s), rc);
+    if (rc != 0) {
+        if (sdu_rx != NULL) {
+            os_mbuf_free_chain(sdu_rx);
+        }
+        side_fail(s, "reouverture du canal CoC");
+    }
+    UNLOCK();
 }
 
 static void
@@ -1090,8 +1133,10 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         if (s != NULL) {
             /* Seule une aide deja annoncee a l'autre (prete ou au-dela) change
              * le groupe ; un echec de configuration ne doit pas couper le son
-             * de l'aide en flux. */
-            bool was_in_group = s->state != ASHA_STATE_SETUP;
+             * de l'aide en flux. L'etat ne suffit pas : une aide qui tombe
+             * pendant la reouverture de son CoC est en SETUP mais faisait
+             * partie du groupe (l'autre restait en stereo, 2026-10-11). */
+            bool was_in_group = s->in_group;
             MODLOG_DFLT(INFO, "ASHA[%s]: aide deconnectee\n", ear_name(s));
             side_release(s);
             if (was_in_group) {
@@ -1184,6 +1229,27 @@ temp_log_task(void *arg)
         if (temperature_sensor_get_celsius(tsens, &c) == ESP_OK) {
             ESP_LOGI("temp", "temperature puce %.1f C", c);
         }
+        /* RSSI du lien de chaque aide connectee (mesure du controleur sur les
+         * paquets recus de l'aide) : sert aux essais de portee. */
+        uint16_t conns[ASHA_SLOT_COUNT];
+        int ears[ASHA_SLOT_COUNT];
+        int n = 0;
+        LOCK();
+        for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+            if (g_sides[i].state != ASHA_STATE_FREE) {
+                conns[n] = g_sides[i].conn_handle;
+                ears[n++] = g_sides[i].ear;
+            }
+        }
+        UNLOCK();
+        for (int i = 0; i < n; i++) {
+            int8_t rssi;
+            if (ble_gap_conn_rssi(conns[i], &rssi) == 0) {
+                ESP_LOGI("rssi", "aide %s : %d dBm",
+                         ears[i] == ASHA_EAR_LEFT ? "G" : (ears[i] == ASHA_EAR_RIGHT ? "D" : "?"),
+                         rssi);
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
@@ -1220,6 +1286,10 @@ app_main(void)
 
     ret = nimble_port_init();
     assert(ret == 0);
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        ble_npl_callout_init(&g_reopen_co[i], nimble_port_get_dflt_eventq(),
+                             asha_reopen_cb, &g_sides[i]);
+    }
 
     /* Configure the host. */
     ble_hs_cfg.reset_cb = blecent_on_reset;

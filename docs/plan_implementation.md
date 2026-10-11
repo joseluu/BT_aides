@@ -834,8 +834,40 @@ l'USB-JTAG, alimentation externe 5 V possible.
   0 erreur I2S, 0 trame jetée ; entrée débranchée −53 dBFS (entrée flottante), source branchée
   volume 0 **−65 dBFS** (−54 dBFS sur la Supermini dans les mêmes conditions), musique volume 30
   **−42 dBFS** sur les deux voies.
-- **Reste à faire** : test d'un canal seul (inversion G/D), ré-appairage et essai avec les aides
-  (nouvelle puce, bonds à refaire), portée avec l'antenne externe.
+- **Essai avec les aides (paire principale, flash effacée)** : appairage, CoC et START
+  acquittés des deux côtés du premier coup, mais **aucun son** au premier flux après l'appairage
+  neuf (bip d'appairage entendu). Off/on des deux aides → son dans les deux aides. À retenir :
+  après un appairage neuf, éteindre et rallumer les aides avant de conclure.
+- **Debug Mate en Passthrough** : ne transmet au PC que si le port est ouvert avec **DTR
+  actif** (PuTTY / moniteur PlatformIO le font ; pyserial : `dtr=True`). Le flux perd des
+  fragments de lignes et arrive avec ~10 s de retard, mais il survit aux gels de la console
+  USB-Serial/JTAG (encore observés à chaque redémarrage de la carte pendant que le port est ouvert).
+- **Crash trouvé et corrigé** : `LoadProhibited` dans `ble_hs_conn_delete_chan` après une
+  réouverture CoC en stéréo. Le canal était rouvert depuis le callback
+  `BLE_L2CAP_EVENT_COC_DISCONNECTED`, quand NimBLE n'a pas encore libéré l'ancien canal : avec
+  `L2CAP_COC_MAX_NUM=2` et deux aides, `ble_l2cap_connect()` échouait en `rc=6`
+  (`BLE_HS_ENOMEM`), en appels récursifs, puis la déconnexion plantait dans NimBLE. Probablement
+  aussi la cause du « droite éloignée → plus de son à gauche » du 2026-10-10. Correctif :
+  réouverture différée par un callout NimBLE (tâche hôte, après libération de l'ancien canal,
+  abandonnée si l'aide est déconnectée entre-temps), `L2CAP_COC_MAX_NUM` = 4, contrôle du
+  tampon de réception et du code retour à l'ouverture. Validé en réel : aide tombée sans panique.
+- **Appartenance au groupe** : une aide qui tombait pendant la réouverture de son CoC était en
+  `SETUP` et n'était pas considérée comme membre du groupe → l'autre restait en stéréo (une
+  seule voie) sans STATUS ni redémarrage mono. Indicateur explicite `in_group` posé quand l'aide
+  est prête. Pas encore vérifié en réel.
+- **RSSI du lien** de chaque aide connectée, journalisé toutes les 5 s (`rssi: aide G : -xx
+  dBm`). Au scan, l'annonce des aides sort à −76/−92 dBm ; une fois connectées, −50 à −75 dBm.
+- **Portée, antenne d'origine de la XIAO** (aides portées, paliers de 20 s) : sans défaut
+  jusqu'à 3 m (RSSI −63 à −81 dBm, presque indépendant de la distance : l'orientation et le
+  corps dominent), **coupure vers 4 m** (creux à −102 dBm côté droit, attentes de crédits des
+  deux côtés, 13 trames sautées). La Supermini décrochait vers 1,5 m. Une minute après le retour,
+  l'aide gauche a coupé d'elle-même (reason 531, RSSI correct, rien de bloqué côté ESP32) :
+  cause inconnue, à capturer au sniffer si ça se reproduit.
+- **Antenne de point d'accès récupérée (connecteur IPEX direct)** : aide vue à −91 dBm à courte
+  distance, connexion perdue 1,4 s après l'établissement (reason 519) ; retour à l'antenne
+  d'origine → reconnexion normale. Antenne à diagnostiquer.
+- **Reste à faire** : test d'un canal seul (inversion G/D), vérification du passage en mono à
+  la perte d'une aide.
 
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
