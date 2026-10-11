@@ -33,3 +33,9 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_ESPTOOLPY_FLASHSIZE_2MB=n
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Bonds enregistres en flash (NVS) : apres un redemarrage de l'ESP32, il se
+# represente aux aides comme un appareil connu et chiffre le lien sans nouvel
+# appairage (les aides n'acceptent un appairage que peu apres leur mise en
+# marche). Avec la distribution de l'identite (IRK), voir main.c.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y

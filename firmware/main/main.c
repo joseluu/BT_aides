@@ -1013,6 +1013,27 @@ blecent_should_connect(const struct ble_gap_disc_desc *disc)
     /* svc_data_uuid16 = [uuid_lo, uuid_hi, version, capability, hisyncid_tronque x4] */
     if (fields.svc_data_uuid16 == NULL || fields.svc_data_uuid16_len < 8 ||
             fields.svc_data_uuid16[0] != 0xF0 || fields.svc_data_uuid16[1] != 0xFD) {
+        /* Aide deja appairee (bond en NVS) : apres un redemarrage de l'ESP32
+         * elle s'annonce sous son adresse d'identite (resolue grace a son
+         * IRK), pas forcement avec les donnees ASHA. Le cote sera connu par
+         * ReadOnlyProperties, qui verifie aussi le HiSyncId. */
+        struct ble_store_key_sec key = {.peer_addr = disc->addr};
+        struct ble_store_value_sec val;
+        struct ble_gap_conn_desc desc;
+        /* Adresse resolue par le controleur : type PUBLIC_ID/RANDOM_ID (2/3),
+         * alors que le bond est enregistre en PUBLIC/RANDOM (0/1). */
+        if (key.peer_addr.type == BLE_ADDR_PUBLIC_ID) {
+            key.peer_addr.type = BLE_ADDR_PUBLIC;
+        } else if (key.peer_addr.type == BLE_ADDR_RANDOM_ID) {
+            key.peer_addr.type = BLE_ADDR_RANDOM;
+        }
+        MODLOG_DFLT(DEBUG, "ASHA: annonce de %s type %d\n", addr_str(disc->addr.val),
+                    disc->addr.type);
+        if (disc->event_type != BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP &&
+                ble_store_read_peer_sec(&key, &val) == 0 &&
+                ble_gap_conn_find_by_addr(&key.peer_addr, &desc) != 0) {
+            return ASHA_EAR_UNKNOWN;
+        }
         return -2;
     }
     if (memcmp(&fields.svc_data_uuid16[4], g_asha_expected_truncated_hisyncid, 4) != 0) {
@@ -1039,7 +1060,8 @@ blecent_connect_if_interesting(const struct ble_gap_disc_desc *disc)
         return;
     }
     MODLOG_DFLT(INFO, "ASHA: aide %s de la paire ciblee vue (rssi %d), connexion...\n",
-                ear == ASHA_EAR_RIGHT ? "droite" : "gauche", disc->rssi);
+                ear == ASHA_EAR_RIGHT ? "droite" :
+                (ear == ASHA_EAR_LEFT ? "gauche" : "deja appairee"), disc->rssi);
 
     /* Le scan doit etre arrete avant d'initier une connexion. */
     rc = ble_gap_disc_cancel();
@@ -1440,12 +1462,13 @@ app_main(void)
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_our_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC;
-#if ASHA_LOG_BOND_KEYS
-    /* IRK de l'aide, pour que le sniffer resolve ses adresses privees
-     * tournantes (Android demande aussi la distribution de l'identite). */
+    /* Distribution de l'identite (IRK), comme Android : les aides changent
+     * d'adresse privee toutes les quelques minutes ; sans leur IRK, une aide
+     * connue n'est pas reconnue apres un redemarrage de l'ESP32 (bonds en
+     * NVS) et la liste blanche ne peut pas la retrouver. Sert aussi au
+     * sniffer (ASHA_LOG_BOND_KEYS). */
     ble_hs_cfg.sm_our_key_dist |= BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ID;
-#endif
     ble_hs_cfg.sm_sc = 1;
 
     blecent_l2cap_coc_mem_init();
