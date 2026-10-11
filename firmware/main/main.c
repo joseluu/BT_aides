@@ -27,6 +27,7 @@
 #include "coc_blecent.h"
 #include "audio_capture.h"
 #include "driver/temperature_sensor.h"
+#include "driver/gpio.h"
 
 static const char *tag = "NimBLE_BLE_CENT_L2CAP_COC";
 static int blecent_gap_event(struct ble_gap_event *event, void *arg);
@@ -229,6 +230,16 @@ side_free_slot(void)
 #ifndef ASHA_LOG_BOND_KEYS
 #define ASHA_LOG_BOND_KEYS 0
 #endif
+
+/* Relance automatique du groupe apres un creux radio (voir asha_group_resync).
+ * Desactivee tant que la relance manuelle (bouton BOOT) n'a pas montre qu'un
+ * STOP/START debloque une aide muette. */
+#ifndef ASHA_AUTO_RESYNC
+#define ASHA_AUTO_RESYNC 0
+#endif
+#define ASHA_RESYNC_DIP_DBM     (-92)
+#define ASHA_RESYNC_OK_DBM      (-85)
+#define ASHA_RESYNC_MIN_GAP_US  (10 * 1000 * 1000LL)
 
 #if ASHA_LOG_BOND_KEYS
 static void
@@ -468,6 +479,32 @@ asha_on_side_lost(void)
     if (g_restart_pending) {
         esp_timer_start_once(g_restart_timer, 1000 * 1000);
     }
+}
+
+/* Relance le groupe (STOP puis START sur toutes les aides en flux) sans
+ * changement de composition. Observe le 2026-10-11 : apres un creux radio,
+ * une aide peut rester muette alors que la liaison est revenue, que les
+ * trames lui parviennent et qu'elle rend ses credits ; elle finit par couper
+ * la liaison (531) quelques minutes plus tard. */
+static void
+asha_group_resync(const char *why)
+{
+    LOCK();
+    if (g_restart_pending || count_in_state(ASHA_STATE_STREAMING) == 0) {
+        UNLOCK();
+        return;
+    }
+    MODLOG_DFLT(WARN, "ASHA: relance du groupe (%s)\n", why);
+    g_restart_pending = true;
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        struct asha_side *s = &g_sides[i];
+        if (s->state == ASHA_STATE_STREAMING || s->state == ASHA_STATE_AWAITING_START_ACK) {
+            s->state = ASHA_STATE_AWAITING_STOP_ACK;
+            asha_send_stop(s);
+        }
+    }
+    esp_timer_start_once(g_restart_timer, 1000 * 1000);
+    UNLOCK();
 }
 
 /* Relance le scan si un emplacement est libre et qu'aucune connexion n'est en
@@ -1194,6 +1231,13 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
             if (was_in_group) {
                 asha_on_side_lost();
             }
+        } else if (g_connecting) {
+            /* Connexion tombee avant BLE_GAP_EVENT_CONNECT (reason 519 juste
+             * apres l'etablissement, 2026-10-11) : sans ceci g_connecting
+             * restait vrai et le scan n'etait jamais relance. */
+            MODLOG_DFLT(ERROR, "ASHA: connexion perdue pendant son etablissement\n");
+            g_connecting = false;
+            g_connecting_ear = ASHA_EAR_UNKNOWN;
         }
         /* Scan actif (pas la liste blanche) : retrouve l'aide de facon fiable
          * apres un off/on (teste 2026-10-05). */
@@ -1294,15 +1338,56 @@ temp_log_task(void *arg)
             }
         }
         UNLOCK();
+        bool dip = false;
+        bool all_good = true;
         for (int i = 0; i < n; i++) {
             int8_t rssi;
             if (ble_gap_conn_rssi(conns[i], &rssi) == 0) {
                 ESP_LOGI("rssi", "aide %s : %d dBm",
                          ears[i] == ASHA_EAR_LEFT ? "G" : (ears[i] == ASHA_EAR_RIGHT ? "D" : "?"),
                          rssi);
+                dip |= rssi <= ASHA_RESYNC_DIP_DBM;
+                all_good &= rssi >= ASHA_RESYNC_OK_DBM;
             }
         }
+#if ASHA_AUTO_RESYNC
+        /* Creux sur une liaison, puis retour des deux a un niveau correct :
+         * relance du groupe, au plus une fois par ASHA_RESYNC_MIN_GAP_US. */
+        static bool s_dip_seen;
+        static int64_t s_last_resync_us;
+        s_dip_seen |= dip;
+        if (s_dip_seen && all_good && n > 0 &&
+            esp_timer_get_time() - s_last_resync_us >= ASHA_RESYNC_MIN_GAP_US) {
+            s_dip_seen = false;
+            s_last_resync_us = esp_timer_get_time();
+            asha_group_resync("apres un creux radio");
+        }
+#else
+        (void)dip;
+        (void)all_good;
+#endif
         vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* Bouton BOOT de la XIAO (GPIO0, actif bas) : relance manuelle du groupe. */
+static void
+boot_button_task(void *arg)
+{
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    int prev = 1;
+    while (1) {
+        int level = gpio_get_level(GPIO_NUM_0);
+        if (prev == 1 && level == 0) {
+            asha_group_resync("bouton BOOT");
+        }
+        prev = level;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -1334,6 +1419,7 @@ app_main(void)
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);
+    xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 2, NULL);
     xTaskCreate(asha_audio_stream_task, "asha_audio", 4096, NULL, 10, NULL);
 
     ret = nimble_port_init();
