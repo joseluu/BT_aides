@@ -1064,10 +1064,74 @@ d'éloignement (relance si l'autre a souffert) a réveillé la gauche muette.
 
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
-- Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).
+- Réglage de volume physique : encodeur rotatif + LED (voir « Interface utilisateur » ci-dessous).
 - Boîtier, alimentation définitive, câblage propre côté prise TV.
 - Documentation utilisateur courte si le boîtier doit être manipulé par quelqu'un d'autre que
   l'utilisateur développeur.
+
+### Interface utilisateur : encodeur rotatif et LED (spécification du 2026-10-17, à implémenter)
+
+Une seule commande : un encodeur rotatif (volume) et une LED. Elle pilote aussi les demandes de
+connexion, donc le Bluetooth peut être entièrement éteint pour laisser le téléphone de l'utilisateur
+libre de se connecter à ses aides.
+
+**Comportement attendu**
+- **Démarrage** : pas de Bluetooth. La LED clignote 0,2 s toutes les 2 s.
+- **Un cran vers la droite** : LED allumée fixe, le Bluetooth démarre et les demandes de connexion
+  sont émises (l'utilisateur est supposé proche). Le volume part du minimum et augmente à chaque
+  cran vers la droite.
+- **Volume au maximum** : clignotement très rapide pendant 2 s (0,2 s toutes les 0,5 s), puis LED
+  allumée fixe.
+- **Vers la gauche** : le volume diminue. Au-delà du minimum, l'appareil déconnecte les aides et
+  éteint le Bluetooth (retour à l'état de démarrage).
+
+```plantuml
+@startuml
+[*] --> Veille
+state "Veille
+Bluetooth éteint
+LED 0,2 s / 2 s" as Veille
+state "Actif
+Bluetooth + connexions
+LED fixe" as Actif
+state "Volume maximum
+LED 0,2 s / 0,5 s pendant 2 s" as Max
+Veille --> Actif : cran à droite
+(volume = minimum)
+Actif --> Actif : cran : volume +/-
+Actif --> Max : volume atteint le maximum
+Max --> Actif : 2 s écoulées (LED fixe)
+Actif --> Veille : cran à gauche
+au-delà du minimum
+(déconnexion, Bluetooth éteint)
+Max --> Veille : cran à gauche
+au-delà du minimum
+@enduml
+```
+
+**Câblage proposé** (numéros de GPIO ; noms de broche de la XIAO ESP32S3 entre parenthèses).
+Hors broches déjà utilisées : I2S du PCM1808 (GPIO5, 6, 7), bouton BOOT (GPIO0), console
+(GPIO43/44). GPIO4 évité (diaphonie avec BCK constatée en phase 3), GPIO3 évité (broche de
+configuration au démarrage).
+
+| Fonction | GPIO | Broche XIAO | Branchement |
+|---|---|---|---|
+| Encodeur A (CLK) | GPIO1 | D0 | borne A |
+| Encodeur B (DT) | GPIO2 | D1 | borne B |
+| Encodeur bouton (SW) | GPIO9 | D10 | optionnel, réservé |
+| Commun de l'encodeur | GND | GND | borne C |
+| LED | GPIO8 | D9 | GPIO8 → 330 Ω → anode, cathode → GND (allumage actif haut) |
+
+- Encodeur nu : résistances de rappel internes activées, plus 10 nF entre A (puis B) et GND contre
+  les rebonds. Module de type KY-040 : alimenter en **3,3 V**, jamais en 5 V.
+- Lecture de préférence par le compteur matériel PCNT (filtre anti-rebond intégré).
+- Garder les fils de l'encodeur à l'écart des fils de l'I2S (horloge de 6 MHz).
+- LED : ~4 mA en rouge avec 330 Ω sous 3,3 V ; 220 Ω pour une LED bleue ou blanche.
+
+**À définir à l'implémentation** : plage et pas du volume (characteristic Volume de l'ASHA, en dB),
+mémorisation du volume en veille, comportement si l'appui sur BOOT (relance du groupe) reste
+disponible, et délai de connexion attendu pour la LED fixe (la LED fixe signale-t-elle « demandé »
+ou « connecté » ?).
 
 ---
 
