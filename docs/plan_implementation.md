@@ -1026,6 +1026,35 @@ proche. **Validé le 2026-10-17** : extinction puis rallumage de chaque aide, l'
 en ~1 s à la perte et continue sans interruption au retour de la première ; le correctif
 d'éloignement (relance si l'autre a souffert) a réveillé la gauche muette.
 
+#### Régime de connexion, durée d'événement Android et limite de portée (2026-10-17, après-midi)
+
+- **Mémoire** (ligne `heap:` toutes les 5 s) : tas libre stable (~203 Ko), minimum figé, plus gros bloc
+  constant (155 648 octets), `mbuf` CoC 14-16/16 : ni fuite ni fragmentation sur ~15 min. Pas de lien
+  avec la durée de fonctionnement.
+- **Le régime des attentes de crédits dépend de la connexion, pas du RSSI** : sur plusieurs captures,
+  0,1-0,3 attente/s pendant des minutes sur une connexion, 3-40/s sur une autre au même RSSI (−65 dBm),
+  qui change à la (re)connexion. Les creux simultanés sur les deux aides laissent les deux muettes
+  malgré une liaison active : la relance automatique les prend maintenant en compte (un seul
+  relevé sous −88 dBm sur toutes les aides en flux suffit).
+- **Code Android** (`hearing_aid.cc`, `UpdateBleConnParams`) : pour 20 ms, intervalle 0x10, latence
+  0x0A, timeout de supervision 0x64, et **`min_ce_len = max_ce_len = 0x000C`** (7,5 ms). Notre
+  firmware demandait 0/0 : le contrôleur ne réservait pas de temps radio par liaison. `ASHA_CE_LEN`
+  = 0x000C appliqué à la demande initiale et au re-tirage. Après ce changement : régime à 0 attente
+  de crédits avant et après une coupure/reconnexion, contre 3-8/s sur l'essai précédent. Un seul
+  cycle, causalité à confirmer. Timeout de supervision conservé à 3 s (Android : 1 s).
+- **Re-tirage** : attentes de crédits lissées ≥ 1,5/s avec RSSI > −80 dBm → renvoi des paramètres de
+  connexion (latence alternée 10/9), au plus une fois par minute et par aide. Seuil à resserrer vers
+  −72 dBm (re-tirages inutiles à signal faible, sans effet vu).
+- **Tampon d'envoi** porté de 6 à 25 trames (500 ms, `QUEUE_DEPTH`) : absorbe les attentes de crédits
+  sans jeter de PCM (jetées stables à 80-83). **À ramener vers 6 (120 ms) avant de brancher la
+  télévision** (latence image/son).
+- **Traces ajoutées** : niveau de sortie après fondu et gain (`sortie G/D`, `gain`) pour distinguer un
+  fondu coincé à zéro d'un silence côté aides.
+- **Portée** : limite à ~4 m (antenne d'origine de la carte), creux à −100/−109 dBm sur les deux
+  aides, coupures brèves puis reconnexion seulement au retour. Puissance d'émission laissée à
+  +9 dBm (décision : pas d'augmentation) ; le RSSI relevé est celui du sens aide → carte, hors de
+  portée d'un réglage côté carte. Piste retenue : travail sur l'antenne.
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).

@@ -14,6 +14,8 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -160,6 +162,9 @@ struct asha_side {
     int64_t struggling_until_us;   /* liaison en difficulte vue recemment (RSSI bas
                                     * ou rafale d'attentes de credits) */
     unsigned stall_seen;           /* stall_count a la derniere mesure du suivi */
+    float stall_score;             /* attentes de credits par seconde, lissees */
+    int64_t last_retune_us;        /* dernier re-tirage des parametres de connexion */
+    bool retune_alt;               /* alterne la latence (10/9) a chaque re-tirage */
     bool joining;                  /* START envoye alors que l'autre aide est deja
                                     * en flux : encodeur de sa voie remis a zero a
                                     * l'ack, sans toucher au flux de l'autre */
@@ -257,6 +262,7 @@ side_free_slot(void)
  * ~30 s, sans perte de son, declenchaient une relance (0,5 s de coupure)
  * par minute. */
 #define ASHA_RESYNC_DIP_SAMPLES  8
+#define ASHA_RESYNC_BOTH_DBM     (-88)
 /* Nombre de mesures RSSI consecutives (une par seconde) au-dessus de
  * ASHA_RESYNC_OK_DBM avant de relancer. */
 #define ASHA_RESYNC_GOOD_SAMPLES 3
@@ -267,6 +273,20 @@ side_free_slot(void)
 #define ASHA_STRUGGLE_DBM        (-85)
 #define ASHA_STRUGGLE_STALLS     10
 #define ASHA_STRUGGLE_HOLD_US    (60 * 1000 * 1000LL)
+/* Regime de connexion degrade (2026-10-17) : les attentes de credits restent a
+ * 3-30 par seconde apres une (re)connexion alors que le RSSI est bon, et a
+ * 0,1-0,3 par seconde sur d'autres connexions avec le meme firmware : le regime
+ * depend de la connexion (hypothese : positions relatives des evenements de
+ * connexion des deux aides). Un changement des parametres de connexion force le
+ * controleur a replacer les evenements. Score = moyenne glissante (~20 s). */
+/* Duree d'evenement de connexion demandee (x0,625 ms) : 0x000C = 7,5 ms, valeur
+ * qu'Android demande pour un intervalle de 20 ms (hearing_aid.cc, MIN/MAX_CE_LEN_20MS_CI,
+ * avec latence 0x000A). Avec 0, le controleur ne reserve pas de temps radio par
+ * liaison et peut faire chevaucher les evenements des deux aides. */
+#define ASHA_CE_LEN              0x000C
+#define ASHA_RETUNE_SCORE        1.5f
+#define ASHA_RETUNE_GAP_US       (60 * 1000 * 1000LL)
+#define ASHA_RETUNE_MIN_DBM      (-80)
 #define ASHA_RESYNC_FADE_MS          200
 /* File de trames (6 x 20 ms) + envoi : les trames du fondu doivent etre
  * parties avant le STOP. */
@@ -393,6 +413,11 @@ asha_on_start_write(uint16_t conn_handle, const struct ble_gatt_error *error,
 static void
 asha_send_start(struct asha_side *s, bool other_connected)
 {
+    /* Un START reveille l'aide : une difficulte de liaison anterieure ne justifie
+     * plus de relance (2026-10-17 : creux de G a -100 dBm 9 s avant, puis G
+     * redemarree seule apres la perte de D, puis relancee a nouveau 4 s plus
+     * tard au retour de D = deux coupures de suite). */
+    s->struggling_until_us = 0;
     asha_send_status(s, other_connected ? ASHA_UPD_OTHER_CONNECTED : ASHA_UPD_OTHER_DISCONNECTED);
 
     uint8_t cmd[5] = {
@@ -1235,8 +1260,8 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
                 .itvl_max = 16,
                 .latency = 10,
                 .supervision_timeout = 300, /* 3000ms */
-                .min_ce_len = 0,
-                .max_ce_len = 0,
+                .min_ce_len = ASHA_CE_LEN,
+                .max_ce_len = ASHA_CE_LEN,
             };
             rc = ble_gap_update_params(event->connect.conn_handle, &conn_params);
             MODLOG_DFLT(INFO, "ASHA[%s]: demande intervalle 20 ms/latence 10, rc=%d\n", ear_name(s), rc);
@@ -1452,6 +1477,15 @@ temp_log_task(void *arg)
         if (log_now && temperature_sensor_get_celsius(tsens, &c) == ESP_OK) {
             ESP_LOGI("temp", "temperature puce %.1f C", c);
         }
+        /* Suivi memoire (fuite ou fragmentation apres une longue duree) : tas
+         * libre, minimum depuis le demarrage, plus gros bloc libre, et mbuf
+         * libres du pool des trames CoC. */
+        if (log_now) {
+            ESP_LOGI("heap", "libre %u, min %u, plus gros bloc %u, mbuf CoC libres %u/%d",
+                     (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                     (unsigned)sdu_coc_mbuf_mempool.mp_num_free, COC_BUF_COUNT);
+        }
         /* RSSI du lien de chaque aide connectee (mesure du controleur sur les
          * paquets recus de l'aide), releve chaque seconde, affiche toutes les
          * 5 s : sert aux essais de portee et a la relance automatique. */
@@ -1473,6 +1507,7 @@ temp_log_task(void *arg)
         UNLOCK();
         int64_t t_now_us = esp_timer_get_time();
         bool dip = false;
+        int n_low = 0, n_measured = 0;
         bool all_good = n_streaming > 0;
         for (int i = 0; i < n; i++) {
             int8_t rssi;
@@ -1493,6 +1528,23 @@ temp_log_task(void *arg)
             if (ss != NULL) {
                 unsigned stalls = ss->stall_count - ss->stall_seen;
                 ss->stall_seen = ss->stall_count;
+                ss->stall_score = ss->stall_score * 0.95f + (float)stalls * 0.05f;
+                if (streaming[i] && rssi > ASHA_RETUNE_MIN_DBM && ss->stall_score >= ASHA_RETUNE_SCORE &&
+                    t_now_us - ss->last_retune_us >= ASHA_RETUNE_GAP_US) {
+                    ss->last_retune_us = t_now_us;
+                    ss->stall_score = 0.0f;
+                    ss->retune_alt = !ss->retune_alt;
+                    struct ble_gap_upd_params p = {
+                        .itvl_min = 16, .itvl_max = 16,
+                        .latency = ss->retune_alt ? 9 : 10,
+                        .supervision_timeout = 300,
+                        .min_ce_len = ASHA_CE_LEN, .max_ce_len = ASHA_CE_LEN,
+                    };
+                    int urc = ble_gap_update_params(conns[i], &p);
+                    MODLOG_DFLT(WARN, "ASHA[%s]: attentes de credits elevees avec un bon RSSI (%d dBm), "
+                                "re-tirage des parametres de connexion (latence %d), rc=%d\n",
+                                ear_name(ss), rssi, p.latency, urc);
+                }
                 if ((rssi > -120 && rssi <= ASHA_STRUGGLE_DBM) || stalls >= ASHA_STRUGGLE_STALLS) {
                     ss->struggling_until_us = t_now_us + ASHA_STRUGGLE_HOLD_US;
                 }
@@ -1504,6 +1556,8 @@ temp_log_task(void *arg)
                 continue;
             }
             dip |= rssi <= ASHA_RESYNC_DIP_DBM;
+            n_measured++;
+            n_low += rssi <= ASHA_RESYNC_BOTH_DBM;
             all_good &= rssi >= ASHA_RESYNC_OK_DBM;
         }
 #if ASHA_AUTO_RESYNC
@@ -1512,7 +1566,12 @@ temp_log_task(void *arg)
             gap_us = ASHA_RESYNC_MIN_GAP_US;
         }
         dip_run = dip ? dip_run + 1 : 0;
-        dip_seen |= dip_run >= ASHA_RESYNC_DIP_SAMPLES;
+        /* Creux simultane sur toutes les aides en flux (>= 2) : meme bref, il
+         * laisse les deux aides muettes (2026-10-17, 355 s : D -103 et G -93 dBm
+         * en meme temps, silence de 2 min liaison pourtant active). Un creux sur
+         * une seule aide, frequent et sans suite, ne compte pas. */
+        bool both_dip = n_measured >= 2 && n_low == n_measured;
+        dip_seen |= dip_run >= ASHA_RESYNC_DIP_SAMPLES || both_dip;
         good_run = all_good ? good_run + 1 : 0;
         if (dip_seen && good_run >= ASHA_RESYNC_GOOD_SAMPLES && (last_resync_us == 0 || now - last_resync_us >= gap_us)) {
             /* Relance rapprochee de la precedente : on espacera davantage la

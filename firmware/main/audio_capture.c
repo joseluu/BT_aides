@@ -45,7 +45,13 @@ static const char *TAG = "audio";
 #define FRAMES_PER_READ      240                       /* 5 ms a 48 kHz */
 #define OUT_PER_READ         (FRAMES_PER_READ / DECIM) /* 80 a 16 kHz */
 #define G722_FRAME_SAMPLES   320                       /* 20 ms a 16 kHz */
-#define QUEUE_DEPTH          6                         /* 120 ms */
+/* Tampon entre l'encodage et l'envoi : absorbe les attentes de credits CoC
+ * (la file se remplit, rien n'est jete). 25 x 20 ms = 500 ms, porte de 120 ms
+ * le 2026-10-17 (liaison degradee, pas de television branchee : la latence
+ * ajoutee ne gene pas). Pour la TV, revenir vers 6 (120 ms). */
+#ifndef QUEUE_DEPTH
+#define QUEUE_DEPTH          25
+#endif
 #define STATS_PERIOD_FRAMES  500                       /* 10 s */
 
 static QueueHandle_t s_frames;
@@ -125,7 +131,7 @@ audio_task(void *arg)
 
     uint32_t produced = 0, dropped = 0, read_errors = 0;
     UBaseType_t max_depth = 0;
-    double sum_sq_l = 0.0, sum_sq_r = 0.0;
+    double sum_sq_l = 0.0, sum_sq_r = 0.0, sum_sq_ol = 0.0, sum_sq_or = 0.0;
     uint32_t n_sq = 0;
 
     ESP_LOGI(TAG, "capture demarree (I2S esclave %d Hz stereo -> 16 kHz -> 2 x G.722 64 kbit/s)",
@@ -166,6 +172,8 @@ audio_task(void *arg)
             if (gain_step > 0.0f) {
                 gain = gain > gain_step ? gain - gain_step : 0.0f;
             }
+            sum_sq_ol += (double)l * l;
+            sum_sq_or += (double)r * r;
             if (stereo) {
                 s_pcm16_l[pcm_count] = to_pcm16(l);
                 s_pcm16_r[pcm_count] = to_pcm16(r);
@@ -221,11 +229,13 @@ audio_task(void *arg)
 
             if (produced % STATS_PERIOD_FRAMES == 0) {
                 ESP_LOGI(TAG, "trames produites %" PRIu32 ", jetees %" PRIu32 ", file max %u/%d,"
-                         " erreurs I2S %" PRIu32 ", %s, niveau G %.1f dBFS, D %.1f dBFS",
+                         " erreurs I2S %" PRIu32 ", %s, niveau G %.1f dBFS, D %.1f dBFS,"
+                         " sortie G %.1f, D %.1f dBFS, gain %.2f",
                          produced, dropped, (unsigned)max_depth, QUEUE_DEPTH, read_errors,
-                         stereo ? "stereo" : "mono", rms_dbfs(sum_sq_l, n_sq), rms_dbfs(sum_sq_r, n_sq));
+                         stereo ? "stereo" : "mono", rms_dbfs(sum_sq_l, n_sq), rms_dbfs(sum_sq_r, n_sq),
+                         rms_dbfs(sum_sq_ol, n_sq), rms_dbfs(sum_sq_or, n_sq), (double)gain);
                 max_depth = 0;
-                sum_sq_l = sum_sq_r = 0.0;
+                sum_sq_l = sum_sq_r = sum_sq_ol = sum_sq_or = 0.0;
                 n_sq = 0;
             }
         }
