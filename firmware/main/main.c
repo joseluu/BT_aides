@@ -99,8 +99,11 @@ _Static_assert(ASHA_FRAME_PAYLOAD_LEN == AUDIO_G722_FRAME_BYTES, "trame ASHA = t
 /* ASHA_UPD_PARAMETERS_UPDATED (0x02) volontairement absent : `03 02 10`
  * envoye avant l'ouverture du CoC faisait echouer celle-ci (LE COC error 6). */
 
-/* 0 dB (volume max, plage ASHA 0 a -128) ; -40 dB (0xd8) dans le sniff Android. */
-static const uint8_t g_asha_volume_db = 0x00;
+/* Volume ASHA en dB (plage 0 a -128, -40 dB = 0xd8 dans le sniff Android).
+ * Pilote par l'encodeur : ASHA_VOL_STEPS crans entre le minimum et 0 dB. */
+#define ASHA_VOL_STEPS   16
+#define ASHA_VOL_MIN_DB  (-100)
+static uint8_t g_asha_volume_db = (uint8_t)(int8_t)ASHA_VOL_MIN_DB;
 
 /* Le compteur de sequence redemarre a 3 a chaque START (sniff HCI Android). */
 #define ASHA_SEQ_FIRST            3
@@ -189,6 +192,11 @@ static SemaphoreHandle_t g_lock;
 static uint8_t g_seq;
 /* Une connexion GAP est en cours d'etablissement (scan arrete pendant ce temps). */
 static bool g_connecting;
+/* Bluetooth « en fonction » : decide par l'encodeur (interface utilisateur).
+ * Faux = aucun scan, aucune connexion, aides deconnectees. */
+static bool g_bt_enabled;
+static bool g_host_synced;
+static void blecent_begin_search(void);
 static int g_connecting_ear = ASHA_EAR_UNKNOWN;
 /* Un redemarrage du groupe attend les ack de STOP (voir asha_group_update). */
 static bool g_restart_pending;
@@ -640,7 +648,8 @@ asha_group_resync(const char *why)
 static void
 asha_maybe_scan(void)
 {
-    if (g_connecting || side_free_slot() == NULL || count_in_state(ASHA_STATE_SETUP) > 0) {
+    if (!g_bt_enabled || g_connecting || side_free_slot() == NULL ||
+        count_in_state(ASHA_STATE_SETUP) > 0) {
         return;
     }
     if (ble_gap_disc_active()) {
@@ -1179,7 +1188,7 @@ blecent_connect_if_interesting(const struct ble_gap_disc_desc *disc)
     uint8_t own_addr_type;
     int rc;
 
-    if (g_connecting || side_free_slot() == NULL) {
+    if (!g_bt_enabled || g_connecting || side_free_slot() == NULL) {
         return;
     }
     int ear = blecent_should_connect(disc);
@@ -1239,6 +1248,10 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status != 0) {
             MODLOG_DFLT(ERROR, "Error: Connection failed; status=%d\n", event->connect.status);
             asha_maybe_scan();
+            break;
+        }
+        if (!g_bt_enabled) {
+            ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             break;
         }
         s = side_free_slot();
@@ -1423,7 +1436,21 @@ blecent_on_sync(void)
     rc = ble_hs_util_ensure_addr(0);
     assert(rc == 0);
 
+    g_host_synced = true;
+    blecent_begin_search();
+}
+
+/* Debut de la recherche des aides (si le Bluetooth est en fonction). */
+static void
+blecent_begin_search(void)
+{
+    int rc;
+
     LOCK();
+    if (!g_bt_enabled || !g_host_synced) {
+        UNLOCK();
+        return;
+    }
     /* Bonds deja en NVS (boot precedent) : connexion "auto-connect" par liste
      * blanche (equivalent Android autoConnect=true), meme apres un RESET de
      * l'ESP32 sans toucher aux aides (teste le 2026-09-24). La premiere aide
@@ -1608,6 +1635,149 @@ temp_log_task(void *arg)
     }
 }
 
+/* ==================== Interface utilisateur : encodeur rotatif + LED ====================
+ * Encodeur A = GPIO1, B = GPIO2 (rappels internes), LED = GPIO8 (actif haut).
+ * Un cran a droite met le Bluetooth en fonction (volume au minimum) puis monte
+ * le volume ; un cran a gauche le baisse, et au-dela du minimum deconnecte les
+ * aides et arrete toute activite radio (le controleur reste initialise).
+ * LED : veille = flash 0,2 s toutes les 2 s ; Bluetooth en fonction et aides
+ * pas toutes connectees = flash rapide 0,2 s toutes les 0,5 s ; aides
+ * connectees = fixe ; volume maximum atteint = flash rapide pendant 2 s. */
+#define UI_PIN_A   GPIO_NUM_1
+#define UI_PIN_B   GPIO_NUM_2
+#define UI_PIN_LED GPIO_NUM_8
+#define UI_MAX_FLASH_US (2 * 1000 * 1000LL)
+
+static int g_ui_level;   /* 0 .. ASHA_VOL_STEPS */
+
+static void
+ui_apply_volume(void)
+{
+    int db = ASHA_VOL_MIN_DB + (-ASHA_VOL_MIN_DB * g_ui_level + ASHA_VOL_STEPS / 2) / ASHA_VOL_STEPS;
+    LOCK();
+    g_asha_volume_db = (uint8_t)(int8_t)db;
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        struct asha_side *s = &g_sides[i];
+        if (s->in_group && s->h.volume != 0 &&
+            (s->state == ASHA_STATE_READY || s->state == ASHA_STATE_STREAMING)) {
+            ble_gattc_write_no_rsp_flat(s->conn_handle, s->h.volume,
+                                        &g_asha_volume_db, sizeof(g_asha_volume_db));
+        }
+    }
+    UNLOCK();
+    MODLOG_DFLT(INFO, "UI: volume cran %d/%d (%d dB)\n", g_ui_level, ASHA_VOL_STEPS, db);
+}
+
+static void
+ui_bt_on(void)
+{
+    LOCK();
+    g_bt_enabled = true;
+    g_ui_level = 0;
+    g_asha_volume_db = (uint8_t)(int8_t)ASHA_VOL_MIN_DB;
+    MODLOG_DFLT(INFO, "UI: Bluetooth en fonction, recherche des aides\n");
+    blecent_begin_search();
+    UNLOCK();
+}
+
+static void
+ui_bt_off(void)
+{
+    LOCK();
+    g_bt_enabled = false;
+    MODLOG_DFLT(INFO, "UI: Bluetooth arrete, deconnexion des aides\n");
+    ble_gap_disc_cancel();
+    if (g_connecting) {
+        ble_gap_conn_cancel();
+    }
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        if (g_sides[i].state != ASHA_STATE_FREE) {
+            ble_gap_terminate(g_sides[i].conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+    UNLOCK();
+}
+
+static void
+ui_turn(int dir)
+{
+    if (dir > 0) {
+        if (!g_bt_enabled) {
+            ui_bt_on();
+        } else if (g_ui_level < ASHA_VOL_STEPS) {
+            g_ui_level++;
+            ui_apply_volume();
+        }
+    } else if (g_bt_enabled) {
+        if (g_ui_level > 0) {
+            g_ui_level--;
+            ui_apply_volume();
+        } else {
+            ui_bt_off();
+        }
+    }
+}
+
+static bool
+ui_aides_connected(void)
+{
+    int n = 0;
+    LOCK();
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        n += g_sides[i].in_group && g_sides[i].state != ASHA_STATE_FREE;
+    }
+    UNLOCK();
+    return n == ASHA_SLOT_COUNT;
+}
+
+static void
+ui_task(void *arg)
+{
+    static const int8_t quad[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
+    const gpio_config_t in = {
+        .pin_bit_mask = (1ULL << UI_PIN_A) | (1ULL << UI_PIN_B),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&in));
+    const gpio_config_t out = { .pin_bit_mask = 1ULL << UI_PIN_LED, .mode = GPIO_MODE_OUTPUT };
+    ESP_ERROR_CHECK(gpio_config(&out));
+
+    uint8_t prev = (gpio_get_level(UI_PIN_A) << 1) | gpio_get_level(UI_PIN_B);
+    int acc = 0;
+    int64_t max_flash_until = 0;
+    while (1) {
+        uint8_t cur = (gpio_get_level(UI_PIN_A) << 1) | gpio_get_level(UI_PIN_B);
+        if (cur != prev) {
+            acc += quad[(prev << 2) | cur];
+            prev = cur;
+            if (cur == 3) {                    /* repos : un cran complet */
+                if (acc >= 2 || acc <= -2) {
+                    bool was_max = g_ui_level == ASHA_VOL_STEPS;
+                    ui_turn(acc > 0 ? 1 : -1);
+                    if (!was_max && g_ui_level == ASHA_VOL_STEPS) {
+                        max_flash_until = esp_timer_get_time() + UI_MAX_FLASH_US;
+                    }
+                }
+                acc = 0;
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+        int ms = (int)((now / 1000) % 2000);
+        bool led;
+        if (!g_bt_enabled) {
+            led = ms < 200;
+        } else if (now < max_flash_until || !ui_aides_connected()) {
+            led = (ms % 500) < 200;
+        } else {
+            led = true;
+        }
+        gpio_set_level(UI_PIN_LED, led);
+        vTaskDelay(1);
+    }
+}
+
 /* Bouton BOOT de la XIAO (GPIO0, actif bas) : relance manuelle du groupe. */
 static void
 boot_button_task(void *arg)
@@ -1662,6 +1832,7 @@ app_main(void)
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);
+    xTaskCreate(ui_task, "ui", 4096, NULL, 2, NULL);
     xTaskCreate(boot_button_task, "boot_btn", 4096, NULL, 2, NULL);
     xTaskCreate(asha_audio_stream_task, "asha_audio", 4096, NULL, 10, NULL);
 

@@ -1128,10 +1128,16 @@ configuration au démarrage).
 - Garder les fils de l'encodeur à l'écart des fils de l'I2S (horloge de 6 MHz).
 - LED : ~4 mA en rouge avec 330 Ω sous 3,3 V ; 220 Ω pour une LED bleue ou blanche.
 
-**À définir à l'implémentation** : plage et pas du volume (characteristic Volume de l'ASHA, en dB),
-mémorisation du volume en veille, comportement si l'appui sur BOOT (relance du groupe) reste
-disponible, et délai de connexion attendu pour la LED fixe (la LED fixe signale-t-elle « demandé »
-ou « connecté » ?).
+**Implémenté (2026-10-17)**, validé au banc : `ui_task` dans `firmware/main/main.c` (test matériel
+isolé dans `test_ui/`).
+- Volume : 16 crans de -100 dB (minimum) à 0 dB (ASHA_VOL_STEPS, ASHA_VOL_MIN_DB), écrit sur les
+  aides connectées à chaque cran et repris dans le START. Il repart au minimum à chaque mise en
+  route du Bluetooth, sans mémorisation.
+- LED : fixe = les deux aides connectées ; clignotement rapide = Bluetooth en fonction et
+  recherche en cours (ou volume maximum atteint, pendant 2 s) ; flash lent = veille.
+- « Bluetooth éteint » = arrêt logiciel du scan et des connexions (aides déconnectées) ; le
+  contrôleur reste initialisé, pour éviter un redémarrage de NimBLE.
+- Le bouton BOOT garde la relance manuelle du groupe.
 
 ---
 
