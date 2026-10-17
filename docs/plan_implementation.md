@@ -966,6 +966,66 @@ continue d'émettre ses annonces pendant qu'elle est connectée.
 À retenir : `MAX_BONDS=3` (le plus récent évince le plus ancien) ; pour changer de paire d'aides
 (`ASHA_TARGET_PAIR`), effacer la flash (`pio run -e xiao_esp32s3 -t erase`) puis appairer.
 
+### Fin du repli en mono : canal toujours affecté à son aide (2026-10-17)
+
+Changement de stratégie : le firmware ne gère plus le passage en mono quand une aide est absente
+ou se déconnecte. Chaque voie du PCM1808 reste affectée à son aide (gauche → aide gauche, droite →
+aide droite), le mélange (G+D)/2 n'est plus utilisé. Cela remplace le comportement « STATUS +
+redémarrage du groupe en mono » décrit plus haut (validation du 2026-10-10/11).
+
+- **Canaux** : `asha_start_all_ready()` active toujours la stéréo, même avec une seule aide prête.
+  `ASHA_STEREO=0` reste possible à la compilation (mélange sur les deux aides).
+- **Aide perdue** (`asha_on_side_lost()`) : l'autre aide reçoit le STATUS « autre côté
+  déconnecté », puis est redémarrée seule (STOP/START, `otherstate=0`) sur sa propre voie.
+  Première version (STATUS seul, flux intact) abandonnée : mesuré le 2026-10-17, l'aide restante
+  devient muette dès que l'autre disparaît (extinction ou coupure 531, liaison pourtant active et
+  crédits rendus) et ne revient qu'après un STOP/START ou son propre 531 (~10 s).
+- **Aide qui revient pendant le flux de l'autre** : elle démarre seule (STATUS « connecté » à
+  l'aide en flux, puis START `otherstate=1` sur la nouvelle), sans STOP/START du groupe. La séquence
+  commune `g_seq` n'est pas remise à 3 (les deux aides se calent dessus). À l'ack du START, seul
+  l'encodeur G.722 de la voie de l'aide qui rejoint est remis à zéro
+  (`audio_capture_reset_channel()`), son décodeur partant à vide ; l'autre voie n'est pas touchée.
+- **Inchangé** : le premier démarrage (aucune aide en flux) et la relance (`asha_group_resync()`,
+  bouton BOOT) arrêtent et relancent toujours le groupe, séquence repartie à 3.
+- **À vérifier en réel** : que la Signia accepte un START avec une séquence en cours (≠ 3) et
+  qu'elle reste calée avec l'autre aide ; continuité du son à proximité, puis essais de distance
+  avec déconnexion et reconnexion d'une aide. Si le START tardif est refusé ou désynchronisé, le
+  repli est le redémarrage commun du groupe à l'arrivée d'une aide (ancien comportement de
+  `asha_group_update()`).
+
+#### Relance automatique rendue moins fréquente (2026-10-17)
+
+Écoute à moins de 0,5 m, antenne d'origine, sans bouger (3 min de traces,
+`sniffs/esp32_serial_11.log`) : capture saine (`jetees` stable, 0 erreur I2S), mais le RSSI
+relevé toutes les 5 s plongeait à −95/−104 dBm environ toutes les 30 s, sans perte de son
+réelle, et la relance automatique se déclenchait toutes les ~60 s (coupure de ~0,5 s puis retour
+progressif du son, reconnu à l'écoute). Environ 1 à 2 attentes de crédits CoC par seconde et par
+aide.
+
+Correctif : un creux ne compte que s'il dure `ASHA_RESYNC_DIP_SAMPLES` (8) mesures consécutives
+sous −92 dBm ; écart minimal entre deux relances automatiques porté à 180 s (maximum 300 s,
+retour au minimum après 600 s de calme). Le bouton BOOT reste disponible, et
+`ASHA_AUTO_RESYNC=0` la désactive. À surveiller : une aide restée muette après un vrai creux
+doit encore être relancée, avec ce délai de réaction plus long.
+
+#### Premier essai d'éloignement : gauche muette après le retour de la droite (2026-10-17)
+
+Traces : `sniffs/esp32_serial_12.log`. La droite descend à −101/−107 dBm avec une rafale
+d'attentes de crédits (151), 25 trames sautées côté ESP32, puis coupe d'elle-même (531) après
+~50 s. La gauche (−86 dBm au plus bas, 51 attentes de crédits) reste connectée et en flux pour
+l'ESP32, mais **reste muette** d'après l'écoute, y compris après le retour de la droite (3 s,
+démarrage seule correct). Avant la fin du repli en mono, la coupure 531 relançait le groupe, ce
+qui réveillait l'autre aide : le démarrage seul ne le fait plus.
+
+Correctif : chaque seconde, le suivi RSSI marque une liaison « en difficulté » pour 60 s si son
+RSSI est ≤ −85 dBm ou si elle a eu ≥ 10 attentes de crédits dans la seconde (régime normal : 1 à
+2 par seconde). Quand une aide revient et qu'une aide en flux est marquée, le groupe est relancé
+(fondu, STOP, START des deux) ; sinon l'aide rejoint seule, sans trou sur l'autre. À valider en
+réel : gauche audible après un retour de la droite, et absence de coupure à la reconnexion au
+proche. **Validé le 2026-10-17** : extinction puis rallumage de chaque aide, l'autre repart seule
+en ~1 s à la perte et continue sans interruption au retour de la première ; le correctif
+d'éloignement (relance si l'autre a souffert) a réveillé la gauche muette.
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).

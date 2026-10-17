@@ -98,8 +98,8 @@ Simplifie la conception (pas de gestion d'énergie critique).
 ### 3.4 Pipeline audio (capture + traitement)
 
 - Capture I2S continue depuis l'ADC externe.
-- Downmix stéréo→mono (simple moyenne, sauf si l'utilisateur veut préserver un signal spécifique
-  d'un canal).
+- Voies gauche et droite traitées séparément (une par aide) : pas de downmix mono, même quand une
+  seule aide est connectée — le canal reste affecté à son aide (décision du 2026-10-17).
 - Rééchantillonnage vers 16 kHz (filtre + décimation/interpolation simple ; pas besoin de qualité
   audiophile, la cible est du G.722 à 64 kbps).
 - Détection de signal / silence (voir §3.7).
@@ -113,7 +113,8 @@ Simplifie la conception (pas de gestion d'énergie critique).
 ### 3.6 Framer ASHA + Séquenceur
 
 - Construit la trame `[0xa1][0x00][seq][160 octets G.722]` (voir référence protocole §7).
-- Compteur de séquence **par connexion**, remis à 3 à chaque nouveau START.
+- Compteur de séquence **commun aux deux aides** (elles se calent dessus), remis à 3 au démarrage
+  ou à la relance du groupe ; une aide qui rejoint un flux en cours reprend le compteur courant.
 - Timing : un tick 20 ms pilote l'envoi vers les deux canaux CoC de façon aussi synchrone que
   possible (les deux aides doivent recevoir leur trame au même rythme pour rester en phase).
 
@@ -125,6 +126,10 @@ Simplifie la conception (pas de gestion d'énergie critique).
   est éteinte ou muette.
 - Arrêt automatique après un délai de silence (ex. quelques secondes) pour libérer les aides pour
   un usage normal (téléphone, environnement) quand la TV ne diffuse rien.
+- Pas de repli en mono : si une aide tombe, l'autre est redémarrée seule (STATUS « autre côté
+  déconnecté », STOP/START) en gardant sa voie — sans cela elle devient muette. Quand l'aide
+  revient, elle démarre seule sans interrompre l'autre, sauf si l'autre a eu une liaison en
+  difficulté récemment (relance du groupe).
 - Gestion des erreurs : reconnexion BLE, ré-ouverture du canal CoC, ré-émission du START si une
   notification d'erreur arrive sur AudioStatusPoint (valeur ≠ `0x00`).
 

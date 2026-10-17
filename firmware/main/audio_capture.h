@@ -24,6 +24,10 @@ esp_err_t audio_capture_start(void);
  * decodeurs des aides repartent de zero). */
 void audio_capture_restart_stream(void);
 
+/* Remet a zero l'encodeur d'une seule voie (aide qui rejoint un flux en
+ * cours), sans vider la file ni toucher a l'autre voie. */
+void audio_capture_reset_channel(bool right);
+
 /* Abaisse lineairement le niveau des deux voies jusqu'au silence en `ms`
  * millisecondes, avant un STOP : l'aide coupe net au STOP mais remonte le son
  * en douceur au START. Le gain revient a 1 au prochain

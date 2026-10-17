@@ -51,6 +51,7 @@ static const char *TAG = "audio";
 static QueueHandle_t s_frames;
 static volatile bool s_restart_requested;
 static volatile bool s_stereo_requested;
+static volatile bool s_reset_left_requested, s_reset_right_requested;
 /* Fondu sortant demande (duree en echantillons a 16 kHz), 0 = aucun. */
 static volatile uint32_t s_fade_request_samples;
 
@@ -186,6 +187,19 @@ audio_task(void *arg)
                 gain = 1.0f;
                 gain_step = 0.0f;
             }
+            /* Aide qui rejoint un flux en cours : seul l'encodeur de sa voie
+             * repart de zero (son decodeur demarre a vide), l'autre n'est pas
+             * touche. */
+            if (s_reset_left_requested) {
+                s_reset_left_requested = false;
+                g722_encoder_destroy(g722_l);
+                g722_l = g722_encoder_new(64000, 0);
+            }
+            if (s_reset_right_requested) {
+                s_reset_right_requested = false;
+                g722_encoder_destroy(g722_r);
+                g722_r = g722_encoder_new(64000, 0);
+            }
             /* File pleine : on saute ces 20 ms de PCM AVANT l'encodage, pour les
              * DEUX voies a la fois. Ne jamais jeter une trame G.722 deja encodee :
              * le codage est differentiel, le decodeur de l'aide divergerait de
@@ -240,6 +254,16 @@ audio_capture_restart_stream(void)
      * prendre une trame encodee avec l'ancien etat avant que le producteur
      * n'ait traite la demande (au plus une trame peut encore passer). */
     xQueueReset(s_frames);
+}
+
+void
+audio_capture_reset_channel(bool right)
+{
+    if (right) {
+        s_reset_right_requested = true;
+    } else {
+        s_reset_left_requested = true;
+    }
 }
 
 void

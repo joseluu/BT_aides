@@ -44,8 +44,8 @@ void ble_store_config_init(void);
 #define MTU                    512
 
 /* 1 : voie gauche du PCM1808 -> aide gauche, voie droite -> aide droite.
- * 0 : melange (G+D)/2 envoye aux deux aides. Avec une seule aide connectee,
- * c'est toujours le melange. */
+ * 0 : melange (G+D)/2 envoye aux deux aides. Le canal reste affecte a son
+ * aide meme si l'autre est absente (pas de repli en mono). */
 #ifndef ASHA_STEREO
 #define ASHA_STEREO 1
 #endif
@@ -157,6 +157,12 @@ struct asha_side {
     bool reopen_pending;           /* reouverture CoC programmee (g_reopen_co) */
     bool in_group;                 /* deja annoncee prete au groupe (reste vrai
                                     * pendant une reouverture du CoC) */
+    int64_t struggling_until_us;   /* liaison en difficulte vue recemment (RSSI bas
+                                    * ou rafale d'attentes de credits) */
+    unsigned stall_seen;           /* stall_count a la derniere mesure du suivi */
+    bool joining;                  /* START envoye alors que l'autre aide est deja
+                                    * en flux : encodeur de sa voie remis a zero a
+                                    * l'ack, sans toucher au flux de l'autre */
 };
 
 static struct asha_side g_sides[ASHA_SLOT_COUNT];
@@ -242,12 +248,25 @@ side_free_slot(void)
 /* Espacement minimal entre deux relances automatiques, double a chaque
  * relance rapprochee jusqu'au maximum, remis au minimum apres
  * ASHA_RESYNC_CALM_US sans relance. */
-#define ASHA_RESYNC_MIN_GAP_US  (10 * 1000 * 1000LL)
-#define ASHA_RESYNC_MAX_GAP_US  (60 * 1000 * 1000LL)
-#define ASHA_RESYNC_CALM_US     (120 * 1000 * 1000LL)
+#define ASHA_RESYNC_MIN_GAP_US  (180 * 1000 * 1000LL)
+#define ASHA_RESYNC_MAX_GAP_US  (300 * 1000 * 1000LL)
+#define ASHA_RESYNC_CALM_US     (600 * 1000 * 1000LL)
+/* Un creux ne compte que s'il dure : au moins ASHA_RESYNC_DIP_SAMPLES mesures
+ * consecutives (une par seconde) sous ASHA_RESYNC_DIP_DBM. Mesure du
+ * 2026-10-17, a moins de 0,5 m : des creux isoles a -95/-104 dBm toutes les
+ * ~30 s, sans perte de son, declenchaient une relance (0,5 s de coupure)
+ * par minute. */
+#define ASHA_RESYNC_DIP_SAMPLES  8
 /* Nombre de mesures RSSI consecutives (une par seconde) au-dessus de
  * ASHA_RESYNC_OK_DBM avant de relancer. */
 #define ASHA_RESYNC_GOOD_SAMPLES 3
+/* Liaison "en difficulte" : RSSI sous ASHA_STRUGGLE_DBM ou ASHA_STRUGGLE_STALLS
+ * attentes de credits en 1 s, pendant ASHA_STRUGGLE_HOLD_US. Si une autre aide
+ * revient pendant ce temps, le groupe est relance au lieu de la laisser
+ * rejoindre seule. */
+#define ASHA_STRUGGLE_DBM        (-85)
+#define ASHA_STRUGGLE_STALLS     10
+#define ASHA_STRUGGLE_HOLD_US    (60 * 1000 * 1000LL)
 #define ASHA_RESYNC_FADE_MS          200
 /* File de trames (6 x 20 ms) + envoi : les trames du fondu doivent etre
  * parties avant le STOP. */
@@ -407,7 +426,9 @@ asha_start_all_ready(void)
     if (n == 0) {
         return;
     }
-    bool stereo = ASHA_STEREO && n == ASHA_SLOT_COUNT;
+    /* Toujours stereo : chaque aide recoit son canal, meme seule (pas de
+     * melange mono quand l'autre est absente). */
+    bool stereo = ASHA_STEREO;
     audio_capture_set_stereo(stereo);
     audio_capture_restart_stream();
     g_seq = ASHA_SEQ_FIRST;
@@ -418,6 +439,9 @@ asha_start_all_ready(void)
         }
     }
 }
+
+static void asha_group_resync(const char *why);
+static bool g_resync_fading;
 
 /* Appele a chaque changement d'etat (aide prete, ack STOP, aide perdue). */
 static void
@@ -439,18 +463,41 @@ asha_group_update(void)
         asha_start_all_ready();
         return;
     }
-    /* Une aide prete rejoint un flux en cours : STOP a celles qui tournent,
-     * redemarrage commun a la reception des ack (ou du minuteur). */
-    MODLOG_DFLT(INFO, "ASHA: nouvelle aide prete pendant le flux, redemarrage du groupe\n");
-    g_restart_pending = true;
+    /* Si l'aide en flux a eu une liaison en difficulte recemment, elle peut etre
+     * restee muette sans que rien ne le montre (2026-10-17 : gauche muette
+     * apres le retour de la droite) : relance du groupe, qui reveille les deux.
+     * Sinon l'aide rejoint seule, sans trou sur l'autre. */
+    int64_t now_us = esp_timer_get_time();
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        struct asha_side *s = &g_sides[i];
+        if ((s->state == ASHA_STATE_STREAMING || s->state == ASHA_STATE_AWAITING_START_ACK) &&
+            now_us < s->struggling_until_us) {
+            if (!g_resync_fading) {
+                asha_group_resync("aide revenue, l'autre a eu une liaison en difficulte");
+            }
+            return;
+        }
+    }
+    if (g_resync_fading) {
+        return;
+    }
+    /* Une aide prete rejoint un flux en cours : elle demarre seule, sans
+     * interrompre l'autre (qui est seulement prevenue par un STATUS). Sequence
+     * commune g_seq conservee : les deux aides se synchronisent dessus. */
+    MODLOG_DFLT(INFO, "ASHA: aide prete pendant le flux, demarrage seule (flux de l'autre intact)\n");
     for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
         struct asha_side *s = &g_sides[i];
         if (s->state == ASHA_STATE_STREAMING || s->state == ASHA_STATE_AWAITING_START_ACK) {
-            s->state = ASHA_STATE_AWAITING_STOP_ACK;
-            asha_send_stop(s);
+            asha_send_status(s, ASHA_UPD_OTHER_CONNECTED);
         }
     }
-    esp_timer_start_once(g_restart_timer, 1000 * 1000);
+    for (int i = 0; i < ASHA_SLOT_COUNT; i++) {
+        struct asha_side *s = &g_sides[i];
+        if (s->state == ASHA_STATE_READY) {
+            s->joining = true;
+            asha_send_start(s, true);
+        }
+    }
 }
 
 /* Filet de securite : une aide qui n'acquitte pas son STOP en 1 s ne doit pas
@@ -472,8 +519,11 @@ asha_restart_timeout(void *arg)
     UNLOCK();
 }
 
-/* Une aide vient de disparaitre (GAP) : prevenir l'autre et la redemarrer
- * seule (otherstate=0, flux mono). */
+/* Une aide vient de disparaitre (GAP) : prevenir l'autre (STATUS) puis la
+ * redemarrer seule (STOP/START, otherstate=0). Le canal reste affecte a son
+ * aide (stereo, pas de melange mono). Mesure du 2026-10-17 : sans ce STOP/START,
+ * l'aide restante devient muette quand l'autre disparait (extinction de la
+ * droite -> gauche coupee, liaison pourtant active et credits rendus). */
 static void
 asha_on_side_lost(void)
 {
@@ -499,7 +549,6 @@ asha_on_side_lost(void)
  * trames lui parviennent et qu'elle rend ses credits ; elle finit par couper
  * la liaison (531) quelques minutes plus tard. */
 static esp_timer_handle_t g_resync_timer;
-static bool g_resync_fading;
 
 static void
 asha_resync_stop_now(void)
@@ -1265,6 +1314,10 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
             if (s->state == ASHA_STATE_AWAITING_START_ACK) {
                 if (status_byte == 0x00) {
                     MODLOG_DFLT(INFO, "ASHA[%s]: START acquitte, flux audio\n", ear_name(s));
+                    if (s->joining) {
+                        s->joining = false;
+                        audio_capture_reset_channel(s->ear == ASHA_EAR_RIGHT);
+                    }
                     s->state = ASHA_STATE_STREAMING;
                     asha_maybe_scan();
                 } else {
@@ -1389,6 +1442,7 @@ temp_log_task(void *arg)
     /* Relance automatique : creux vu sur une liaison, puis toutes les liaisons
      * au-dessus de ASHA_RESYNC_OK_DBM pendant ASHA_RESYNC_GOOD_SAMPLES s. */
     bool dip_seen = false;
+    int dip_run = 0;
     int good_run = 0;
     int64_t last_resync_us = 0;
     int64_t gap_us = ASHA_RESYNC_MIN_GAP_US;
@@ -1417,6 +1471,7 @@ temp_log_task(void *arg)
             }
         }
         UNLOCK();
+        int64_t t_now_us = esp_timer_get_time();
         bool dip = false;
         bool all_good = n_streaming > 0;
         for (int i = 0; i < n; i++) {
@@ -1430,6 +1485,19 @@ temp_log_task(void *arg)
                          ears[i] == ASHA_EAR_LEFT ? "G" : (ears[i] == ASHA_EAR_RIGHT ? "D" : "?"),
                          rssi);
             }
+            /* Suivi des liaisons en difficulte (voir asha_group_update) : RSSI
+             * bas, ou rafale d'attentes de credits (>= 10 en 1 s ; le regime
+             * normal est de 1 a 2 par seconde). */
+            LOCK();
+            struct asha_side *ss = side_by_conn(conns[i]);
+            if (ss != NULL) {
+                unsigned stalls = ss->stall_count - ss->stall_seen;
+                ss->stall_seen = ss->stall_count;
+                if ((rssi > -120 && rssi <= ASHA_STRUGGLE_DBM) || stalls >= ASHA_STRUGGLE_STALLS) {
+                    ss->struggling_until_us = t_now_us + ASHA_STRUGGLE_HOLD_US;
+                }
+            }
+            UNLOCK();
             /* Seules les aides en flux comptent ; -127 = pas encore de mesure
              * (liaison toute neuve : fausse relance observee au demarrage). */
             if (!streaming[i] || rssi <= -120) {
@@ -1443,9 +1511,10 @@ temp_log_task(void *arg)
         if (now - last_resync_us >= ASHA_RESYNC_CALM_US) {
             gap_us = ASHA_RESYNC_MIN_GAP_US;
         }
-        dip_seen |= dip;
+        dip_run = dip ? dip_run + 1 : 0;
+        dip_seen |= dip_run >= ASHA_RESYNC_DIP_SAMPLES;
         good_run = all_good ? good_run + 1 : 0;
-        if (dip_seen && good_run >= ASHA_RESYNC_GOOD_SAMPLES && now - last_resync_us >= gap_us) {
+        if (dip_seen && good_run >= ASHA_RESYNC_GOOD_SAMPLES && (last_resync_us == 0 || now - last_resync_us >= gap_us)) {
             /* Relance rapprochee de la precedente : on espacera davantage la
              * suivante (une aide en limite de portee relancerait sans cesse). */
             if (last_resync_us != 0 && now - last_resync_us < ASHA_RESYNC_CALM_US) {
@@ -1458,6 +1527,7 @@ temp_log_task(void *arg)
 #else
         (void)dip;
         (void)dip_seen;
+        (void)dip_run;
         (void)good_run;
         (void)last_resync_us;
         (void)gap_us;
