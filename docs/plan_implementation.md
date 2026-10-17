@@ -1138,6 +1138,9 @@ isolé dans `test_ui/`).
 - « Bluetooth éteint » = arrêt logiciel du scan et des connexions (aides déconnectées) ; le
   contrôleur reste initialisé, pour éviter un redémarrage de NimBLE.
 - Le bouton BOOT garde la relance manuelle du groupe.
+- Bouton de l'encodeur (GPIO9, D10, actif bas) : change de paire. Bluetooth arrêté, puis 1 flash de
+  LED = paire principale, 2 flashs = paire secondaire (par défaut). Le choix est mémorisé en NVS
+  (espace "ui", clé "pair"). Compilé le 2026-10-17, à valider au banc.
 
 ---
 

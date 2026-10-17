@@ -114,13 +114,16 @@ static uint8_t g_asha_volume_db = (uint8_t)(int8_t)ASHA_VOL_MIN_DB;
  * de ces aides sont des adresses privees qui tournent en 1-2 min : seul le
  * HiSyncId identifie la paire. */
 #ifndef ASHA_TARGET_PAIR
-#define ASHA_TARGET_PAIR 1
+#define ASHA_TARGET_PAIR 2
 #endif
-#if ASHA_TARGET_PAIR == 2
-static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x34, 0x44, 0x43, 0x31};
-#else
-static const uint8_t g_asha_expected_truncated_hisyncid[4] = {0x30, 0x45, 0x43, 0x45};
-#endif
+/* Paire courante (1 ou 2) : valeur par defaut ASHA_TARGET_PAIR, remplacee au
+ * demarrage par le choix memorise en NVS, changee par l'appui sur l'encodeur. */
+static int g_target_pair = ASHA_TARGET_PAIR;
+static const uint8_t g_hisyncid_by_pair[2][4] = {
+    {0x30, 0x45, 0x43, 0x45},   /* paire 1 */
+    {0x34, 0x44, 0x43, 0x31},   /* paire 2 */
+};
+#define g_asha_expected_truncated_hisyncid (g_hisyncid_by_pair[g_target_pair - 1])
 
 /* ==================== Contexte par aide ==================== */
 
@@ -1463,7 +1466,7 @@ blecent_begin_search(void)
     int num_bonded = 0;
     rc = ble_store_util_bonded_peers(bonded_peers, &num_bonded,
                                       sizeof(bonded_peers) / sizeof(bonded_peers[0]));
-    if (rc == 0 && num_bonded > 0 && ASHA_TARGET_PAIR == 1) {
+    if (rc == 0 && num_bonded > 0 && g_target_pair == 1) {
         rc = ble_gap_wl_set(bonded_peers, num_bonded);
         MODLOG_DFLT(INFO, "ASHA: %d bond(s) existant(s), liste blanche programmee, rc=%d\n",
                     num_bonded, rc);
@@ -1646,6 +1649,7 @@ temp_log_task(void *arg)
 #define UI_PIN_A   GPIO_NUM_1
 #define UI_PIN_B   GPIO_NUM_2
 #define UI_PIN_LED GPIO_NUM_8
+#define UI_PIN_SW  GPIO_NUM_9   /* bouton de l'encodeur, actif bas : change de paire */
 #define UI_MAX_FLASH_US (2 * 1000 * 1000LL)
 
 static int g_ui_level;   /* 0 .. ASHA_VOL_STEPS */
@@ -1718,6 +1722,37 @@ ui_turn(int dir)
     }
 }
 
+/* Choix de la paire memorise en NVS (cle "pair"). */
+static void
+ui_pair_load(void)
+{
+    nvs_handle_t h;
+    uint8_t v;
+    if (nvs_open("ui", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, "pair", &v) == ESP_OK && (v == 1 || v == 2)) {
+            g_target_pair = v;
+        }
+        nvs_close(h);
+    }
+    MODLOG_DFLT(INFO, "UI: paire %d\n", g_target_pair);
+}
+
+static void
+ui_pair_toggle(void)
+{
+    if (g_bt_enabled) {
+        ui_bt_off();
+    }
+    g_target_pair = g_target_pair == 1 ? 2 : 1;
+    nvs_handle_t h;
+    if (nvs_open("ui", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "pair", (uint8_t)g_target_pair);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    MODLOG_DFLT(INFO, "UI: paire %d selectionnee (Bluetooth arrete)\n", g_target_pair);
+}
+
 static bool
 ui_aides_connected(void)
 {
@@ -1740,6 +1775,14 @@ ui_task(void *arg)
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&in));
+    const gpio_config_t sw = {
+        .pin_bit_mask = 1ULL << UI_PIN_SW,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&sw));
+    int sw_prev = 1;
+    int64_t pair_flash_start = 0;
     const gpio_config_t out = { .pin_bit_mask = 1ULL << UI_PIN_LED, .mode = GPIO_MODE_OUTPUT };
     ESP_ERROR_CHECK(gpio_config(&out));
 
@@ -1764,9 +1807,21 @@ ui_task(void *arg)
         }
 
         int64_t now = esp_timer_get_time();
+        int sw_level = gpio_get_level(UI_PIN_SW);
+        if (sw_prev == 1 && sw_level == 0) {
+            ui_pair_toggle();
+            pair_flash_start = now;
+        }
+        sw_prev = sw_level;
+
         int ms = (int)((now / 1000) % 2000);
+        int64_t since_pair_ms = (now - pair_flash_start) / 1000;
         bool led;
-        if (!g_bt_enabled) {
+        if (pair_flash_start != 0 && since_pair_ms < g_target_pair * 400 + 400) {
+            /* 1 flash = paire 1, 2 flashs = paire 2 (150 ms allume toutes les 400 ms) */
+            led = since_pair_ms >= 200 && since_pair_ms < g_target_pair * 400 + 200 &&
+                  ((since_pair_ms - 200) % 400) < 150;
+        } else if (!g_bt_enabled) {
             led = ms < 200;
         } else if (now < max_flash_until || !ui_aides_connected()) {
             led = (ms % 500) < 200;
@@ -1832,6 +1887,7 @@ app_main(void)
 
     ESP_ERROR_CHECK(audio_capture_start());
     xTaskCreate(temp_log_task, "temp_log", 3072, NULL, 2, NULL);
+    ui_pair_load();
     xTaskCreate(ui_task, "ui", 4096, NULL, 2, NULL);
     xTaskCreate(boot_button_task, "boot_btn", 4096, NULL, 2, NULL);
     xTaskCreate(asha_audio_stream_task, "asha_audio", 4096, NULL, 10, NULL);
