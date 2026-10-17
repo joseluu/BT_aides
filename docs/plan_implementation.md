@@ -1055,6 +1055,13 @@ d'éloignement (relance si l'autre a souffert) a réveillé la gauche muette.
   +9 dBm (décision : pas d'augmentation) ; le RSSI relevé est celui du sens aide → carte, hors de
   portée d'un réglage côté carte. Piste retenue : travail sur l'antenne.
 
+- **Relance sur période de liaison faible** : essai à 4 m, liaison faible pendant ~35 s (D −72 à
+  −100 dBm, G jusqu'à −87), puis ~90 s de silence aides connectées avec liaison revenue à −60 dBm,
+  sans relance (creux espacés, jamais simultanés). Nouveau déclencheur : score à décroissance 0,9/s
+  alimenté quand une aide en flux est à ≤ −80 dBm, seuil 4 (~5 s faibles de suite ou ~8 sur 12) ;
+  relance au retour du signal (3 s au-dessus de −85 dBm), 180 s minimum entre relances. Retour
+  utilisateur : connexion et surtout reconnexion nettement plus immédiates, meilleur confort.
+
 ## Phase 7 — Finition (optionnelle, selon retour d'usage)
 
 - Réglage de volume physique (potentiomètre → mappé sur la characteristic Volume).

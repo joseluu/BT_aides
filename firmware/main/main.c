@@ -263,6 +263,15 @@ side_free_slot(void)
  * par minute. */
 #define ASHA_RESYNC_DIP_SAMPLES  8
 #define ASHA_RESYNC_BOTH_DBM     (-88)
+/* Periode de liaison faible : au moins l'une des aides en flux sous
+ * ASHA_RESYNC_WEAK_DBM pendant une bonne partie des dernieres secondes (score
+ * a decroissance 0,9/s, seuil ASHA_RESYNC_WEAK_SCORE : ~5 secondes faibles de
+ * suite, ou ~8 sur 12). Un releve isole sous le seuil, frequent a 0,5 m sans
+ * consequence, ne compte pas. 2026-10-17, essai a 4 m : liaison faible
+ * (-76/-100 dBm) pendant 35 s, puis ~90 s de silence aides connectees, liaison
+ * revenue a -60 dBm, aucune relance (pas de creux assez long ni simultane). */
+#define ASHA_RESYNC_WEAK_DBM     (-80)
+#define ASHA_RESYNC_WEAK_SCORE   4.0f
 /* Nombre de mesures RSSI consecutives (une par seconde) au-dessus de
  * ASHA_RESYNC_OK_DBM avant de relancer. */
 #define ASHA_RESYNC_GOOD_SAMPLES 3
@@ -1468,6 +1477,7 @@ temp_log_task(void *arg)
      * au-dessus de ASHA_RESYNC_OK_DBM pendant ASHA_RESYNC_GOOD_SAMPLES s. */
     bool dip_seen = false;
     int dip_run = 0;
+    float weak_score = 0.0f;
     int good_run = 0;
     int64_t last_resync_us = 0;
     int64_t gap_us = ASHA_RESYNC_MIN_GAP_US;
@@ -1508,6 +1518,7 @@ temp_log_task(void *arg)
         int64_t t_now_us = esp_timer_get_time();
         bool dip = false;
         int n_low = 0, n_measured = 0;
+        bool any_weak = false;
         bool all_good = n_streaming > 0;
         for (int i = 0; i < n; i++) {
             int8_t rssi;
@@ -1557,6 +1568,7 @@ temp_log_task(void *arg)
             }
             dip |= rssi <= ASHA_RESYNC_DIP_DBM;
             n_measured++;
+            any_weak |= rssi <= ASHA_RESYNC_WEAK_DBM;
             n_low += rssi <= ASHA_RESYNC_BOTH_DBM;
             all_good &= rssi >= ASHA_RESYNC_OK_DBM;
         }
@@ -1571,7 +1583,8 @@ temp_log_task(void *arg)
          * en meme temps, silence de 2 min liaison pourtant active). Un creux sur
          * une seule aide, frequent et sans suite, ne compte pas. */
         bool both_dip = n_measured >= 2 && n_low == n_measured;
-        dip_seen |= dip_run >= ASHA_RESYNC_DIP_SAMPLES || both_dip;
+        weak_score = weak_score * 0.9f + (any_weak ? 1.0f : 0.0f);
+        dip_seen |= dip_run >= ASHA_RESYNC_DIP_SAMPLES || both_dip || weak_score >= ASHA_RESYNC_WEAK_SCORE;
         good_run = all_good ? good_run + 1 : 0;
         if (dip_seen && good_run >= ASHA_RESYNC_GOOD_SAMPLES && (last_resync_us == 0 || now - last_resync_us >= gap_us)) {
             /* Relance rapprochee de la precedente : on espacera davantage la
